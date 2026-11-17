@@ -12,10 +12,15 @@ target_sources(
     alarm_success_view.c
     alarm_ring_view.c
     quota_qrcode_view.c
+    sd_music_sync_view.c
 )
 
 if(CONFIG_OTA)
     target_sources(${LISA_UI_LIB_NAME} PRIVATE ota_view.c)
+endif()
+
+if(CONFIG_LOG_UPLOAD)
+    target_sources(${LISA_UI_LIB_NAME} PRIVATE log_upload_view.c)
 endif()
 
 target_include_directories(

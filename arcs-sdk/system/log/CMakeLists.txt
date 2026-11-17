@@ -1,3 +1,5 @@
+if (CONFIG_LOG)
+
 listenai_library_sources(
     lisa_log.c
 )
@@ -10,8 +12,13 @@ if (DEFINED CONFIG_LOG_BACKEND_CONSOLE)
     listenai_library_sources(lisa_log_backend_console.c)
 endif()
 
+if (DEFINED CONFIG_LOG_BACKEND_IPC_WRITER)
+    listenai_library_sources(lisa_log_backend_ipc.c)
+endif()
+
 if (DEFINED CONFIG_LOG_BACKEND_SEGGER_RTT)
     listenai_library_sources(lisa_log_backend_segger_rtt.c)
 endif()
 
 listenai_include_directories(./)
+endif()

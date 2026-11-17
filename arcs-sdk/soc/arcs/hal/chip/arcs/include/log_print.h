@@ -30,6 +30,9 @@ extern void logDump(uint8_t *data, int len);
 
 extern void UART_log32(uint8_t log_id, uint32_t log_data);
 extern void UART_logN(uint8_t log_id, uint8_t *log_data_ptr, uint8_t log_data_length);
+void log_level(uint32_t level);
+void log_time();
+void logDbg_enable_set(uint8_t logD_on_off);
 
 #ifndef CONTROL_LOG_OVER_TLOG
 #define CONTROL_LOG_OVER_TLOG  0
@@ -53,6 +56,7 @@ extern void UART_logN(uint8_t log_id, uint8_t *log_data_ptr, uint8_t log_data_le
 //#ifndef TASKMSK
 //#define TASKMSK   TASKMSK_NONE
 //#endif
+#define CLOGN(fmt, ...)     do {if (cloglvl >= CLOG_LEVEL_NONE)  {  CLOG(fmt,##__VA_ARGS__); CLOG("\n");}} while(0)
 
 #define CLOGE(fmt, ...)     do {if (cloglvl >= CLOG_LEVEL_ERROR)  { CLOG("ERR:"fmt,##__VA_ARGS__);}} while(0)
 #define CLOGW(fmt, ...)     do {if (cloglvl >= CLOG_LEVEL_WARN)   { CLOG("WRN:"fmt,##__VA_ARGS__);}} while(0)

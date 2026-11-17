@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 #include "../utils/acomp_err.h"
 #include "acomp_stream_ipc.h"
@@ -20,6 +21,23 @@ extern "C" {
 #define WAKEUP_INDEX_AI_WRAP (2)
 
 #define ALIGN_SIZE(len) ((len + IPC_ALIGN_SIZE - 1) / IPC_ALIGN_SIZE * IPC_ALIGN_SIZE)
+
+typedef enum {
+    ACOMP_WAKEUP_RES_STORAGE_FLASH = ACOMP_RES_STORAGE_FLASH,
+    ACOMP_WAKEUP_RES_STORAGE_SD = ACOMP_RES_STORAGE_SD,
+    ACOMP_WAKEUP_RES_STORAGE_PSRAM = ACOMP_RES_STORAGE_PSRAM,
+} acomp_wakeup_res_storage_t;
+
+typedef struct {
+    acomp_wakeup_res_storage_t storage;
+    uintptr_t addr;
+    uint32_t size;
+} acomp_wakeup_res_item_t;
+
+typedef struct {
+    acomp_wakeup_res_item_t mlp;
+    acomp_wakeup_res_item_t wrap;
+} acomp_wakeup_resource_config_t;
 
 /*语音唤醒组件回调事件定义*/
 #define WAKEUP_CB_EVENT_ENGINE_RLT       BIT(0) /*语音唤醒引擎结果返回*/
@@ -49,11 +67,9 @@ typedef enum {
 
 /*门限等级定义*/
 typedef enum {
-    ACOMP_WAKEUP_THRESHOLD_LEVEL_1 = 0,  /*门限等级1（最低，极易唤醒）*/
-    ACOMP_WAKEUP_THRESHOLD_LEVEL_2 = 1,  /*门限等级2（易唤醒）*/
-    ACOMP_WAKEUP_THRESHOLD_LEVEL_3 = 2,  /*门限等级3（默认档位）*/
-    ACOMP_WAKEUP_THRESHOLD_LEVEL_4 = 3,  /*门限等级4（难唤醒）*/
-    ACOMP_WAKEUP_THRESHOLD_LEVEL_5 = 4,  /*门限等级5（极难唤醒）*/
+    ACOMP_WAKEUP_THRESHOLD_LEVEL_1 = 0,  /*门限等级1（易唤醒）*/
+    ACOMP_WAKEUP_THRESHOLD_LEVEL_2 = 1,  /*门限等级2（默认档位）*/
+    ACOMP_WAKEUP_THRESHOLD_LEVEL_3 = 2,  /*门限等级3（难唤醒）*/
 } acomp_wakeup_threshold_level_e;
 
 #ifdef CONFIG_ACOMP_WAKEUP_ALGORITHM_TYPE_DUAL_MIC
@@ -95,7 +111,7 @@ extern int acomp_wakeup_init(void);
 //  * @return GCL_OK : 成功
 //  *
 //  */
-// extern int acomp_wakeup_deinit(void);
+extern int acomp_wakeup_deinit(void);
 
 /**
  * @brief 就绪语音唤醒组件（WAKEUP）
@@ -108,6 +124,19 @@ extern int acomp_wakeup_init(void);
  *
  */
 extern int acomp_wakeup_prepare(void);
+
+/**
+ * @brief 使用指定资源配置就绪语音唤醒组件（WAKEUP）
+ *
+ * @param config[in] 自定义资源配置，支持 Flash / eMMC / PSRAM
+ *
+ * @return ACOMP_ERR_OK : 成功
+ * @retval ACOMP_ERR_INVALID_ARG : 错误参数
+ * @retval ACOMP_ERR_NO_MEM : 没有足够内存
+ * @retval ACOMP_ERR_INVALID_STATE : 无效状态
+ *
+ */
+extern int acomp_wakeup_prepare_with_resources(const acomp_wakeup_resource_config_t *config);
 
 /**
  * @brief 复位语音唤醒组件（WAKEUP）
@@ -175,7 +204,7 @@ extern int acomp_wakeup_stop(void);
  *
  * @note 该函数必须在调用 acomp_wakeup_start() 之后设置才能生效
  *
- * @param mode[in] 算法模式,参考 acomp_wakeup_algo_mode_e
+ * @param mode[in] 算法模式, 参考 acomp_wakeup_algo_mode_e
  *
  * @return ACOMP_ERR_OK : 成功
  * @retval ACOMP_ERR_INVALID_ARG : 错误参数
@@ -185,12 +214,19 @@ extern int acomp_wakeup_stop(void);
 extern int acomp_wakeup_set_algo_mode(acomp_wakeup_algo_mode_e mode);
 
 /**
+ * @brief Enable the AP VAD gate only while the device is in standby.
+ *
+ * A disabled gate forwards every audio frame to the wakeup algorithm.
+ */
+extern int acomp_wakeup_set_vad_gate_enabled(uint8_t enable);
+
+/**
  * @brief 设置唤醒门限等级
  *
  * @note 该函数必须在调用 acomp_wakeup_start() 之后设置才能生效
  *
- * @param level[in] 门限等级,参考 acomp_wakeup_threshold_level_e (1-5)
- *                  等级1最容易唤醒,等级6最难唤醒
+ * @param level[in] 门限等级,参考 acomp_wakeup_threshold_level_e (0-2)
+ *                  等级0容易唤醒,等级2难唤醒
  *
  * @return ACOMP_ERR_OK : 成功
  * @retval ACOMP_ERR_INVALID_ARG : 错误参数
@@ -198,6 +234,20 @@ extern int acomp_wakeup_set_algo_mode(acomp_wakeup_algo_mode_e mode);
  *
  */
 extern int acomp_wakeup_set_threshold(acomp_wakeup_threshold_level_e level);
+
+/**
+ * @brief 设置 ESR 命令词识别超时时间
+ *
+ * @note 该函数必须在调用 acomp_wakeup_start() 之后设置才能生效
+ *       timeout_ms=0 表示不进入 ESR 识别模式, 仅发唤醒信号
+ *
+ * @param timeout_ms[in] 超时时间(ms)
+ *
+ * @return ACOMP_ERR_OK : 成功
+ * @retval ACOMP_ERR_INVALID_STATE : 无效状态
+ *
+ */
+extern int acomp_wakeup_set_timeout(uint32_t timeout_ms);
 
 /**
  * @brief 给组件增加事件回调函数
@@ -307,13 +357,6 @@ extern void* acomp_wakeup_stream_tx_buffer_alloc(int chn, uint32_t* len, uint16_
  *
  */
 extern int acomp_wakeup_stream_tx_buffer_submit(int chn, void* buffer, uint32_t len, uint16_t desc_idx);
-
-/**
- *
- * @note 索引0必须是WAKEUP_INDEX_CAE_ESR_MLP资源
- * @note 索引1必须是WAKEUP_INDEX_AI_WRAP资源
- */
-int acomp_wakeup_prepare_with_config(acomp_ipc_prepare_t *prepare);
 
 #ifdef __cplusplus
 }

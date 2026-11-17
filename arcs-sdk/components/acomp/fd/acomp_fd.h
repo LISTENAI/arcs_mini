@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "../utils/acomp_err.h"
 #include "acomp_stream_ipc.h"
+#include "ipc/acomp_ipc.h"
 #include "acomp_fd_params.h"
 
 #ifdef __cplusplus
@@ -14,6 +15,25 @@ extern "C" {
 #ifndef BIT
 #define BIT(x) (1 << (x))
 #endif
+
+typedef enum {
+    ACOMP_FD_RES_STORAGE_FLASH = ACOMP_RES_STORAGE_FLASH,
+    ACOMP_FD_RES_STORAGE_SD = ACOMP_RES_STORAGE_SD,
+    ACOMP_FD_RES_STORAGE_PSRAM = ACOMP_RES_STORAGE_PSRAM,
+} acomp_fd_res_storage_t;
+
+typedef struct {
+    acomp_fd_res_storage_t storage;
+    uintptr_t addr;
+    uint32_t size;
+} acomp_fd_res_item_t;
+
+typedef struct {
+    acomp_fd_res_item_t detect;
+    acomp_fd_res_item_t align;
+    acomp_fd_res_item_t live;
+    acomp_fd_res_item_t verify;
+} acomp_fd_resource_config_t;
 
 /* 人脸识别组件参数设置 */
 
@@ -90,6 +110,16 @@ typedef struct {
     int     feature_cnt;                            /* 人脸特征点个数 */
 }acomp_fd_feature_result_t;
 
+#if defined(CONFIG_SOC_VENUSA)
+/**
+ * @brief 人脸有效性结构体
+ */
+typedef struct {
+	float valid_socre;		// 有效性分数
+	int   valid_state;		// 有效性状态
+}acomp_fd_face_valid_t;
+#endif
+
 /**
  * @brief 人脸检测完整结果
  */
@@ -100,11 +130,14 @@ typedef struct {
 	int                             n_align_point;                          /* 人脸标定点个数 */
 	acomp_fd_head_pose_t            pose;                                   /* 人脸头部姿势 */
 	acomp_fd_live_detect_result_t   live_result;                            /* 活体检测结果 */
+#if defined(CONFIG_SOC_VENUSA)
+	acomp_fd_face_valid_t			face_valid;								/* 人脸有效性 */
+#endif
 	int			                    face_id;                                /* 人脸id */
     float                           features[ACOMP_FD_MAX_FEATURE_CNT];     /* 人脸特征点 */
     int                             feature_cnt;                            /* 人脸特征点个数 */
     float                           compare_scores[ACOMP_FD_MAX_RESULT_CNT];/* 输入图片和已注册人脸特征(最大10个人脸注册)的比较得分 */
-    int                             compare_cnt;                            /* 已经注册人脸特征个数 */    
+    int                             compare_cnt;                            /* 已经注册人脸特征个数 */
 }acomp_fd_result_t;
 
 typedef struct {
@@ -137,7 +170,7 @@ extern int acomp_fd_init(void);
 //  * @retval -GCL_ERR_COMM_FAIL(209) : 通讯失败
 //  *
 //  */
-// extern int acomp_fd_deinit(void);
+extern int acomp_fd_deinit(void);
 
 /**
  * @brief 就绪人脸识别组件（FD）
@@ -150,6 +183,19 @@ extern int acomp_fd_init(void);
  *
  */
 extern int acomp_fd_prepare(void);
+
+/**
+ * @brief 使用指定资源配置就绪人脸识别组件（FD）
+ *
+ * @param config[in] 自定义资源配置，支持 Flash / eMMC / PSRAM
+ *
+ * @return ACOMP_ERR_OK : 成功
+ * @retval ACOMP_ERR_INVALID_ARG : 错误参数
+ * @retval ACOMP_ERR_NO_MEM : 没有足够内存
+ * @retval ACOMP_ERR_INVALID_STATE : 无效状态
+ *
+ */
+extern int acomp_fd_prepare_with_resources(const acomp_fd_resource_config_t *config);
 
 /**
  * @brief 复位人脸识别组件（FD）

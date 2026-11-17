@@ -14,6 +14,10 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
+
+#include "voice_msg_structure.h"
+
 /**
  * @brief 初始化电池 UI 层
  *
@@ -22,6 +26,25 @@ extern "C" {
  * 必须在 battery_init() 之后调用。
  */
 void battery_ui_init(void);
+
+/**
+ * @brief 获取当前 UI 显示使用的电池信息
+ *
+ * @param info 输出参数
+ * @return true 获取成功
+ * @return false 参数无效
+ */
+bool battery_ui_get_info(voice_msg_battery_info_t *info);
+
+/**
+ * @brief 在深度待机期间停止周期电池采样定时器
+ *
+ * 进入待机时停止 1s 定时器，唤醒时重新启动；恢复后的首次采样会在
+ * 一个完整周期后执行。
+ *
+ * @param suspended true 停止定时器，false 恢复定时器
+ */
+void battery_ui_set_sampling_suspended(bool suspended);
 
 #if defined(__cplusplus)
 }

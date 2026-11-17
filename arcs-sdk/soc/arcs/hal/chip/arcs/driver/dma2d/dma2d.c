@@ -88,6 +88,7 @@ typedef struct _csk_dma2d_ch_info {
 static csk_dma2d_ch_info_t dma2d_ch_info[CSK_DMA2D_MAX_CHANNEL_NUM] = {0};
 
 static volatile uint8_t DMA2D_GLB_FLAG = 0;
+extern volatile uint8_t GPDMA_ALLCHN_FLAG;
 
 static void DMA2D_IRQ_Handler(void);
 
@@ -136,6 +137,7 @@ DMA2D_Config(csk_dma2d_init_t* res, CSK_DMA2D_SignalEvent_t cb_event, void* work
     if (dma_2d_ch6 <= res->trigger_ch && dma_2d_ch9 >= res->trigger_ch)
     {
         IP_DMA2D->REG_DMA_CH_TRIGGER_CTRL.all |= (((res->trigger_ch - dma_2d_ch6)<<((res->dma_ch - dma_2d_ch6) * 2))|((0x1 << (res->dma_ch - dma_2d_ch6))<<8));
+        IP_DMA2D->REG_DMA_IMAGE_FEATURE_CTRL.all |= ((0x1 << (res->dma_ch - dma_2d_ch6))<<GP_DMAC_DMA_IMAGE_FEATURE_CTRL_CFG_TRIGGERED_DST_ADDRFIX_SEL_6_Pos);
     }
 
     // Get channel control base address
@@ -914,14 +916,21 @@ DMA2D_GetCnt(csk_dma2d_ch_t ch, uint32_t *sample_len) {
 
 int32_t
 DMA2D_Initialize(void) {
-    if (DMA2D_GLB_FLAG == 0){
-
+    if (0 == GPDMA_ALLCHN_FLAG) {
         // Rest DMA2D module
         IP_AP_CFG->REG_SW_RESET.bit.DMAC_GP_RESET = 1;
+        __HAL_CRM_GPDMA_CLK_ENABLE();
+    }
+    GPDMA_ALLCHN_FLAG++;
+
+    if (DMA2D_GLB_FLAG == 0){
+
+//        // Rest DMA2D module
+//        IP_AP_CFG->REG_SW_RESET.bit.DMAC_GP_RESET = 1;
 
         memset(dma2d_ch_info, 0, sizeof(dma2d_ch_info));
 
-        __HAL_CRM_GPDMA_CLK_ENABLE();
+//        __HAL_CRM_GPDMA_CLK_ENABLE();
 
         // Clear DMA2D interrupt
         IP_DMA2D->REG_DMA_IMAGE_INT_CLR.bit.CFG_IMAGE_BLOCK_FINISH_CLR = 0xF;
@@ -948,6 +957,47 @@ DMA2D_Initialize(void) {
     }
 
     DMA2D_GLB_FLAG++;
+
+    return CSK_DRIVER_OK;
+}
+
+int32_t
+DMA2D_Uninitialize(void){
+    DMA2D_GLB_FLAG--;
+
+    if (DMA2D_GLB_FLAG == 0){
+//        // Device reset
+//        IP_AP_CFG->REG_SW_RESET.bit.DMAC_GP_RESET = 1;
+
+        // Disable DMA2D interrupt
+        IP_DMA2D->REG_DMA_IMAGE_INT_EN.bit.CFG_IMAGE_BLOCK_FINISH_INT_EN = 0x0;
+        IP_DMA2D->REG_DMA_IMAGE_INT_EN.bit.CFG_IMAGE_HALF_BLOCK_FINISH_INT_EN = 0x0;
+
+        // Disable interrupt
+        disable_IRQ(IRQ_DMAC_GP_IMG_VECTOR);
+        // Unregister interrupt
+        register_ISR(IRQ_DMAC_GP_IMG_VECTOR, NULL, NULL);
+
+        // clear information
+        memset(dma2d_ch_info, 0, sizeof(dma2d_ch_info));
+
+        // clear channel configure
+        IP_DMA2D->REG_DMA_CH_CLR.bit.CFG_CH_CLR = 0x3C0;
+
+//        __HAL_CRM_GPDMA_CLK_DISABLE();
+
+        uint8_t i = 0;
+        for (i = 6; i < CSK_DMA2D_MAX_CHANNEL_NUM; i++) {
+            dma2d_ch_info[i].status = dma2d_status_init;
+        }
+    }
+
+    GPDMA_ALLCHN_FLAG--;
+    if (0 == GPDMA_ALLCHN_FLAG) {
+        // Device reset
+        IP_AP_CFG->REG_SW_RESET.bit.DMAC_GP_RESET = 1;
+        __HAL_CRM_GPDMA_CLK_DISABLE();
+    }
 
     return CSK_DRIVER_OK;
 }
@@ -1096,6 +1146,47 @@ DMA2D_Image_Config_Extend(csk_dma2d_ch_t ch, csk_dma_2d_image_cfg_t* img_cfg) {
 	    case csk_jpeg_dec_pack: // YYYYY..../UUUUUUU..../VVVVV.... -->>  YUV
 	    {
 	    	IP_DMA2D->REG_DMA_IMAGE_ENC_DEC_CTRL.bit.CFG_ENC_DEC_SEL |= (0x1 << (ch - dma_2d_ch6)); // enable dec 2daddr
+			IP_DMA2D->REG_DMA_DEC_IN2D_BYPASS.bit.CFG_DEC_IN2D_BYPASS &= ~(0x1 << (ch - dma_2d_ch6));
+			if (dma_2d_ch6 == ch)
+			{
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH6.bit.CFG_D2_ADDR_BYPASS_CH6  = 0x0;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH6.bit.CFG_D2_ADDR_HNUM_CH6 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH6.bit.CFG_D2_ADDR_WNUM_CH6 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH6.bit.CFG_D2_ADDR_BLK_NUM_CH6  = 0x3;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH6.bit.CFG_D2_ADDR_BLK_NUM0_CH6 = c_plane_num;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH6.bit.CFG_D2_ADDR_BLK_NUM1_CH6 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH6.bit.CFG_D2_ADDR_BLK_NUM2_CH6 = 0x1;
+			}
+			else if (dma_2d_ch7 == ch)
+			{
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH7.bit.CFG_D2_ADDR_BYPASS_CH7  = 0x0;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH7.bit.CFG_D2_ADDR_HNUM_CH7 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH7.bit.CFG_D2_ADDR_WNUM_CH7 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH7.bit.CFG_D2_ADDR_BLK_NUM_CH7  = 0x3;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH7.bit.CFG_D2_ADDR_BLK_NUM0_CH7 = c_plane_num;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH7.bit.CFG_D2_ADDR_BLK_NUM1_CH7 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH7.bit.CFG_D2_ADDR_BLK_NUM2_CH7 = 0x1;
+			}
+			else if (dma_2d_ch8 == ch)
+			{
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH8.bit.CFG_D2_ADDR_BYPASS_CH8  = 0x0;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH8.bit.CFG_D2_ADDR_HNUM_CH8 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH8.bit.CFG_D2_ADDR_WNUM_CH8 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH8.bit.CFG_D2_ADDR_BLK_NUM_CH8  = 0x3;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH8.bit.CFG_D2_ADDR_BLK_NUM0_CH8 = c_plane_num;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH8.bit.CFG_D2_ADDR_BLK_NUM1_CH8 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH8.bit.CFG_D2_ADDR_BLK_NUM2_CH8 = 0x1;
+			}
+			else
+			{
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH9.bit.CFG_D2_ADDR_BYPASS_CH9  = 0x0;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH9.bit.CFG_D2_ADDR_HNUM_CH9 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH9.bit.CFG_D2_ADDR_WNUM_CH9 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH9.bit.CFG_D2_ADDR_BLK_NUM_CH9  = 0x3;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH9.bit.CFG_D2_ADDR_BLK_NUM0_CH9 = c_plane_num;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH9.bit.CFG_D2_ADDR_BLK_NUM1_CH9 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH9.bit.CFG_D2_ADDR_BLK_NUM2_CH9 = 0x1;
+			}
 
 	    	dma2d_ch_info[ch].mode_2d = csk_jpeg_dec_pack;
 	    }
@@ -1103,7 +1194,47 @@ DMA2D_Image_Config_Extend(csk_dma2d_ch_t ch, csk_dma_2d_image_cfg_t* img_cfg) {
 	    case csk_jpeg_dec_2d_transfer: // Y*64/ U*64/V*64 ....  -->>  YYY.../UUU.../VVV...
 	    {
 	    	IP_DMA2D->REG_DMA_IMAGE_ENC_DEC_CTRL.bit.CFG_ENC_DEC_SEL |= (0x1 << (ch - dma_2d_ch6)); // enable dec 2daddr
-
+			IP_DMA2D->REG_DMA_DEC_OUT2D_BYPASS.bit.CFG_DEC_OUT2D_BYPASS &= ~(0x1 << (ch - dma_2d_ch6));
+			if (dma_2d_ch6 == ch)
+			{
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH6.bit.CFG_D2_ADDR_BYPASS_CH6  = 0x0;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH6.bit.CFG_D2_ADDR_HNUM_CH6 = 0x8;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH6.bit.CFG_D2_ADDR_WNUM_CH6 = 0x2;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH6.bit.CFG_D2_ADDR_BLK_NUM_CH6  = 0x3;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH6.bit.CFG_D2_ADDR_BLK_NUM0_CH6 = c_plane_num;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH6.bit.CFG_D2_ADDR_BLK_NUM1_CH6 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH6.bit.CFG_D2_ADDR_BLK_NUM2_CH6 = 0x1;
+			}
+			else if (dma_2d_ch7 == ch)
+			{
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH7.bit.CFG_D2_ADDR_BYPASS_CH7  = 0x0;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH7.bit.CFG_D2_ADDR_HNUM_CH7 = 0x8;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH7.bit.CFG_D2_ADDR_WNUM_CH7 = 0x2;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH7.bit.CFG_D2_ADDR_BLK_NUM_CH7  = 0x3;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH7.bit.CFG_D2_ADDR_BLK_NUM0_CH7 = c_plane_num;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH7.bit.CFG_D2_ADDR_BLK_NUM1_CH7 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH7.bit.CFG_D2_ADDR_BLK_NUM2_CH7 = 0x1;
+			}
+			else if (dma_2d_ch8 == ch)
+			{
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH8.bit.CFG_D2_ADDR_BYPASS_CH8  = 0x0;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH8.bit.CFG_D2_ADDR_HNUM_CH8 = 0x8;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH8.bit.CFG_D2_ADDR_WNUM_CH8 = 0x2;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH8.bit.CFG_D2_ADDR_BLK_NUM_CH8  = 0x3;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH8.bit.CFG_D2_ADDR_BLK_NUM0_CH8 = c_plane_num;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH8.bit.CFG_D2_ADDR_BLK_NUM1_CH8 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH8.bit.CFG_D2_ADDR_BLK_NUM2_CH8 = 0x1;
+			}
+			else
+			{
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH9.bit.CFG_D2_ADDR_BYPASS_CH9  = 0x0;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH9.bit.CFG_D2_ADDR_HNUM_CH9 = 0x8;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL0_CH9.bit.CFG_D2_ADDR_WNUM_CH9 = 0x2;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH9.bit.CFG_D2_ADDR_BLK_NUM_CH9  = 0x3;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL3_CH9.bit.CFG_D2_ADDR_BLK_NUM0_CH9 = c_plane_num;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH9.bit.CFG_D2_ADDR_BLK_NUM1_CH9 = 0x1;
+				IP_DMA2D->REG_DMA_IMAGE_D2_ADDR_CTRL4_CH9.bit.CFG_D2_ADDR_BLK_NUM2_CH9 = 0x1;
+			}
 	    	dma2d_ch_info[ch].mode_2d = csk_jpeg_dec_2d_transfer;
 	    }
 	        break;

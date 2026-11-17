@@ -7,8 +7,10 @@
 #include "model_voice.h"
 #include "model_wifi.h"
 #include "model_qrcode.h"
+#include "model_modem.h"
 #include "model_alarm.h"
 #include "model_battery.h"
+#include "model_sd_music_sync.h"
 
 extern void alarm_navigation_init(void);
 extern const struct lisa_ui_nav_scr home_nav_scr;
@@ -21,8 +23,12 @@ extern const struct lisa_ui_nav_scr setting_clock_nav_scr;
 extern const struct lisa_ui_nav_scr alarm_success_nav_scr;
 extern const struct lisa_ui_nav_scr alarm_ring_nav_scr;
 extern const struct lisa_ui_nav_scr quota_qrcode_nav_scr;
+extern const struct lisa_ui_nav_scr sd_music_sync_nav_scr;
 #ifdef CONFIG_OTA
 extern const struct lisa_ui_nav_scr ota_nav_scr;
+#endif
+#ifdef CONFIG_LOG_UPLOAD
+extern const struct lisa_ui_nav_scr log_upload_nav_scr;
 #endif
 
 static int lisa_ui_model_init(void)
@@ -34,6 +40,8 @@ static int lisa_ui_model_init(void)
     // model_camera_init();
     model_qrcode_init();
     model_battery_init();
+    model_modem_init();
+    model_sd_music_sync_init();
 
     return 0;
 }
@@ -55,8 +63,12 @@ int lisa_ui_app_init(void)
     lisa_ui_nav_scr_add(&alarm_success_nav_scr);
     lisa_ui_nav_scr_add(&alarm_ring_nav_scr);
     lisa_ui_nav_scr_add(&quota_qrcode_nav_scr);
+    lisa_ui_nav_scr_add(&sd_music_sync_nav_scr);
 #ifdef CONFIG_OTA
     lisa_ui_nav_scr_add(&ota_nav_scr);
+#endif
+#ifdef CONFIG_LOG_UPLOAD
+    lisa_ui_nav_scr_add(&log_upload_nav_scr);
 #endif
 
     /* fisrt src will be open and show now */

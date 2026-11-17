@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 #define TAG "info_presenter"
 
@@ -8,16 +9,81 @@
 #include "lisa_ui_nav_scr_ids.h"
 #include "info_view.h"
 #include "model_qrcode.h"
+#include "voice_cloud.h"
 
 struct info_nav_scr_data {
     lv_obj_t *view;          /**< Info view object */
     lv_timer_t *auto_return; /**< Auto return timer */
     lv_timer_t *retry_qr;    /**< QR data retry timer */
+    lv_timer_t *guard_timer; /**< Provisioning guard timer */
+    bool provision_locked;   /**< Whether provisioning page is currently forced */
+    uint32_t qr_wait_started;
 };
+
+static void auto_return_timer_cb(lv_timer_t *timer);
+
+static bool info_should_lock_page_by_cloud_state(void)
+{
+    voice_cloud_state_t cloud_state = voice_cloud_get_state();
+
+    if (cloud_state == VOICE_CLOUD_STATE_CONNECTED) {
+        return false;
+    }
+
+    switch (cloud_state) {
+    case VOICE_CLOUD_STATE_CONNECTING:
+        LISA_UI_LOGI("Info page not locked: cloud state CONNECTING");
+        return false;
+    case VOICE_CLOUD_STATE_NO_NETWORK:
+        LISA_UI_LOGI("Keep info page: cloud state NO_NETWORK");
+        return true;
+    case VOICE_CLOUD_STATE_NO_INTERNET:
+        LISA_UI_LOGI("Keep info page: cloud state NO_INTERNET");
+        return true;
+    case VOICE_CLOUD_STATE_TOKEN_FAILED:
+        LISA_UI_LOGI("Keep info page: cloud state TOKEN_FAILED");
+        return true;
+    case VOICE_CLOUD_STATE_CONNECT_FAILED:
+        LISA_UI_LOGI("Keep info page: cloud state CONNECT_FAILED");
+        return true;
+    case VOICE_CLOUD_STATE_CONNECTED:
+    default:
+        return false;
+    }
+}
+
+static void info_auto_return_start(struct info_nav_scr_data *scr_data)
+{
+    if (!scr_data || scr_data->auto_return) {
+        return;
+    }
+
+#ifdef CONFIG_BOARD_ARCS_MINI
+    scr_data->auto_return = lv_timer_create(auto_return_timer_cb, 30000, scr_data);
+#else
+    scr_data->auto_return = lv_timer_create(auto_return_timer_cb, 10000, scr_data);
+#endif
+    if (scr_data->auto_return) {
+        lv_timer_set_repeat_count(scr_data->auto_return, 1);
+    }
+}
 
 static void auto_return_timer_cb(lv_timer_t *timer)
 {
+    struct info_nav_scr_data *scr_data = (struct info_nav_scr_data *)timer->user_data;
+
     LISA_UI_LOGD("Auto return timer triggered");
+
+    /* repeat_count=1，LVGL 会在本回调返回后自动释放 timer，
+     * 提前清空指针避免 close 时 double-free */
+    if (scr_data) {
+        scr_data->auto_return = NULL;
+    }
+
+    if (info_should_lock_page_by_cloud_state()) {
+        LISA_UI_LOGI("Info page is locked by cloud state, skip auto return");
+        return;
+    }
 
     lisa_ui_nav_scr_nav_back();
 }
@@ -33,20 +99,40 @@ static void retry_qr_timer_cb(lv_timer_t *timer)
     }
 
     qrcode_data_t qr_data;
-    if (model_qrcode_get_config_data(&qr_data) == 0) {
+    if (model_qrcode_get_data(&qr_data) == 0) {
         lisa_ui_info_view_set_top_text(scr_data->view, qr_data.top_text);
         lisa_ui_info_view_set_bottom_text(scr_data->view, qr_data.bottom_text);
 
-        if (qr_data.qr_image) {
-            lisa_ui_info_view_set_qr_image(scr_data->view, qr_data.qr_image);
+        lisa_ui_info_view_set_qr_image(scr_data->view, qr_data.qr_image);
+        if (qr_data.qr_image || qr_data.status != QR_STATUS_CONNECTED) {
             if (scr_data->retry_qr) {
                 lv_timer_del(scr_data->retry_qr);
                 scr_data->retry_qr = NULL;
             }
+        } else if (lv_tick_elaps(scr_data->qr_wait_started) >= 10000) {
+            /* 继续等待迟到的下载结果，但不要无限显示“加载中”。 */
+            lisa_ui_info_view_set_top_text(scr_data->view, "二维码暂未就绪");
+            lisa_ui_info_view_set_bottom_text(scr_data->view, "请稍后重试\n单击返回");
         }
     } else {
         LISA_UI_LOGE("Failed to get QR data on retry, will retry again");
     }
+}
+
+static void guard_timer_cb(lv_timer_t *timer)
+{
+    struct info_nav_scr_data *scr_data = (struct info_nav_scr_data *)timer->user_data;
+
+    if (!scr_data || !scr_data->view) {
+        return;
+    }
+
+    if (info_should_lock_page_by_cloud_state()) {
+        return;
+    }
+
+    scr_data->provision_locked = false;
+    lisa_ui_nav_scr_nav_back();
 }
 
 static int info_nav_scr_open(const struct lisa_ui_nav_scr *scr, void **data)
@@ -69,26 +155,27 @@ static int info_nav_scr_open(const struct lisa_ui_nav_scr *scr, void **data)
     }
 
     qrcode_data_t qr_data;
-    if (model_qrcode_get_config_data(&qr_data) == 0) {
+    if (model_qrcode_get_data(&qr_data) == 0) {
         lisa_ui_info_view_set_top_text(scr_data->view, qr_data.top_text);
         lisa_ui_info_view_set_bottom_text(scr_data->view, qr_data.bottom_text);
 
-        if (qr_data.qr_image) {
-            lisa_ui_info_view_set_qr_image(scr_data->view, qr_data.qr_image);
-        } else {
+        lisa_ui_info_view_set_qr_image(scr_data->view, qr_data.qr_image);
+        if (!qr_data.qr_image && qr_data.status == QR_STATUS_CONNECTED) {
             LISA_UI_LOGD("QR image not ready, creating retry timer");
-            scr_data->retry_qr = lv_timer_create(retry_qr_timer_cb, 100, scr_data);
+            scr_data->qr_wait_started = lv_tick_get();
+            scr_data->retry_qr = lv_timer_create(retry_qr_timer_cb, 500, scr_data);
         }
     } else {
         LISA_UI_LOGE("Failed to get QR data from model");
     }
 
-#ifdef CONFIG_BOARD_ARCS_MINI
-    scr_data->auto_return = lv_timer_create(auto_return_timer_cb, 30000, NULL);
-#else // !CONFIG_BOARD_ARCS_MINI
-    scr_data->auto_return = lv_timer_create(auto_return_timer_cb, 10000, NULL);
-#endif
-    lv_timer_set_repeat_count(scr_data->auto_return, 1);
+    scr_data->provision_locked = info_should_lock_page_by_cloud_state();
+
+    if (scr_data->provision_locked) {
+        scr_data->guard_timer = lv_timer_create(guard_timer_cb, 1000, scr_data);
+    } else {
+        info_auto_return_start(scr_data);
+    }
 
     *data = scr_data;
     return 0;
@@ -147,6 +234,11 @@ static int info_nav_scr_close(const struct lisa_ui_nav_scr *scr, void *data)
         if (scr_data->retry_qr) {
             lv_timer_del(scr_data->retry_qr);
             scr_data->retry_qr = NULL;
+        }
+
+        if (scr_data->guard_timer) {
+            lv_timer_del(scr_data->guard_timer);
+            scr_data->guard_timer = NULL;
         }
 
         if (scr_data->view) {

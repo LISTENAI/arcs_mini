@@ -1,16 +1,9 @@
-#include <string.h>
-
 #include "voice_player_comm.h"
-#include "sys_init.h"
-#include "voice_msg.h"
-#include "app_datas.h"
-
-#include "tone.h"
 #include "app_player.h"
-#include "lsc.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"
 #include "lisa_gpio.h"
 #include "kv.h"
 #include "lisa_kv.h"
@@ -19,228 +12,176 @@
 #include "lisa_log.h"
 #include "board.h"
 
-// 播放器实例
+/** 播放器实例 */
 app_player_t *tone_player = NULL;
 app_player_t *tts_player = NULL;
 app_player_t *music_player = NULL;
 app_player_t *alert_player = NULL;
+#ifdef CONFIG_MINIAPP_BUZZER
+app_player_t *miniapp_player = NULL;
+#endif
 
-// 播放列表管理
-#define MAX_PLAYLIST_SIZE 100
+/** 系统音量（1-100），Kconfig 配置默认值 */
+static int g_system_volume = CONFIG_VOICE_PLAYER_DEFAULT_VOLUME;
 
-typedef struct {
-    char id[32];        // 音频ID
-    char name[64];      // 音频名称
-    uint8_t playable;   // 是否可播放
-} playlist_item_t;
+/** 音量线程句柄 */
+static TaskHandle_t g_volume_thread = NULL;
+/** 音量线程信号量 */
+static SemaphoreHandle_t g_volume_sem = NULL;
 
-typedef struct {
-    playlist_item_t items[MAX_PLAYLIST_SIZE];
-    int count;          // 列表长度
-    int current_index;  // 当前播放索引
-} playlist_t;
-
-static playlist_t g_playlist = {0};
-
-// 系统音量（1-100）
-static int g_system_volume = 50;
-
-void voice_player_system_volume_init(void);
-
+/**
+ * @brief   PA 控制回调函数
+ * @param   onoff 1 开启 PA，0 关闭 PA
+ * @return  0 成功，其他失败
+ */
+#ifndef CONFIG_BOARD_ARCS_MINI3
 #define PA_PIN_NUM PA_EN_PIN
 #define PA_GPIO_DEVICE CONFIG_PA_DEVICE_NAME
+#endif
 
-/**
- * @brief PA控制回调函数
- */
-static int pa_control_callback(int onoff)
-{
-    LOGI("PA %s", onoff ? "ON" : "OFF");
-    return lisa_gpio_write_pin(lisa_device_get(PA_GPIO_DEVICE), PA_PIN_NUM, onoff ? LISA_GPIO_HIGH : LISA_GPIO_LOW);
-}
+#ifdef CONFIG_BOARD_ARCS_MINI3
+#ifndef PA_MUTE_ACTIVE_LEVEL
+#define PA_MUTE_ACTIVE_LEVEL 1
+#endif
 
-/**
- * @brief 播放列表中指定索引的音频（自动跳过不可播放项）
- */
-static int playlist_play_index(int index)
+static lisa_device_t *s_pa_mute_dev = NULL;
+static bool s_pa_mute_configured = false;
+
+static uint32_t pa_mute_level(bool mute)
 {
-    if (index < 0 || index >= g_playlist.count) {
-        LOGE("Invalid playlist index: %d (count: %d)", index, g_playlist.count);
-        return -1;
+    bool active_high = (PA_MUTE_ACTIVE_LEVEL != 0);
+
+    if (mute) {
+        return active_high ? LISA_GPIO_HIGH : LISA_GPIO_LOW;
     }
 
-    // 从当前索引开始查找可播放的项
-    int search_count = 0;
-    int current_idx = index;
+    return active_high ? LISA_GPIO_LOW : LISA_GPIO_HIGH;
+}
 
-    while (search_count < g_playlist.count) {
-        playlist_item_t *item = &g_playlist.items[current_idx];
-
-        // 目前不检查该标记
-        // if (!item->playable) {
-        //     LOGW("Item %s is not playable, skipping to next", item->id);
-        //     current_idx = (current_idx + 1) % g_playlist.count;
-        //     search_count++;
-        //     continue;
-        // }
-
-        // 从ID获取播放URL
-        char url[256] = {0};
-        int ret = lsc_music_request_url(item->id, url);
-
-        if (ret != 0 || url[0] == '\0') {
-            LOGE("Failed to get URL for item: %s (ret=%d), skipping to next", item->id, ret);
-            current_idx = (current_idx + 1) % g_playlist.count;
-            search_count++;
-            continue;
-        }
-
-        LOGI("Playing playlist item [%d/%d]: %s - %s",
-             current_idx + 1, g_playlist.count, item->name, item->id);
-        LOGI("URL: %s", url);
-
-        g_playlist.current_index = current_idx;
-        ret = app_player_play(music_player, url);
-
-        if (ret != APP_PLAYER_OK) {
-            LOGE("Failed to play item: %s, skipping to next", item->id);
-            current_idx = (current_idx + 1) % g_playlist.count;
-            search_count++;
-            continue;
-        }
-
+static int pa_mute_hw_init(void)
+{
+    if (s_pa_mute_configured) {
         return 0;
     }
 
-    LOGE("No playable items in playlist");
-    return -1;
-}
-
-/**
- * @brief 播放器事件回调
- */
-static void player_event_callback(app_player_t *player, app_player_event_t event, void *user_data)
-{
-    const char *player_name = (const char *)user_data;
-
-    switch (event) {
-    case APP_PLAYER_EVENT_PREPARED:
-        LOGI("[%s] Player prepared", player_name);
-        break;
-    case APP_PLAYER_EVENT_PLAYING:
-        LOGI("[%s] Player playing", player_name);
-        break;
-    case APP_PLAYER_EVENT_PAUSED:
-        LOGI("[%s] Player paused", player_name);
-        break;
-    case APP_PLAYER_EVENT_COMPLETED:
-        LOGI("[%s] Player completed", player_name);
-
-        // 音乐播放完成后自动播放下一首
-        if (player == music_player && g_playlist.count > 0) {
-            int next_index = g_playlist.current_index + 1;
-            if (next_index < g_playlist.count) {
-                LOGI("Auto-advancing to next track");
-                playlist_play_index(next_index);
-            } else {
-                LOGI("Playlist completed");
-                g_playlist.current_index = -1;
-            }
-        }
-        break;
-    case APP_PLAYER_EVENT_ERROR:
-        LOGE("[%s] Player error", player_name);
-
-        // 播放错误时尝试播放下一首
-        if (player == music_player && g_playlist.count > 0) {
-            int next_index = g_playlist.current_index + 1;
-            if (next_index < g_playlist.count) {
-                LOGI("Error occurred, trying next track");
-                playlist_play_index(next_index);
-            }
-        }
-        break;
-    case APP_PLAYER_EVENT_STOPPED:
-        LOGI("[%s] Player stopped", player_name);
-        break;
-    default:
-        break;
+    s_pa_mute_dev = lisa_device_get(PA_MUTE_DEVICE_NAME);
+    if (!lisa_device_ready(s_pa_mute_dev)) {
+        LOGE("Error: %s device not ready", PA_MUTE_DEVICE_NAME);
+        return -1;
     }
+
+    uint32_t init_flag = pa_mute_level(true) ? LISA_GPIO_OUTPUT_INIT_HIGH : LISA_GPIO_OUTPUT_INIT_LOW;
+    int ret = lisa_gpio_configure(s_pa_mute_dev, PA_MUTE_PIN, LISA_GPIO_OUTPUT | init_flag);
+    if (ret != 0) {
+        LOGE("PA mute GPIO configure failed: %d", ret);
+        return -1;
+    }
+
+    s_pa_mute_configured = true;
+    return 0;
+}
+#endif
+
+static int pa_control_callback(int onoff)
+{
+#ifdef CONFIG_BOARD_ARCS_MINI3
+    if (pa_mute_hw_init() != 0) {
+        return -1;
+    }
+
+    LOGI("PA %s via exmcu mute", onoff ? "ON" : "OFF");
+    return lisa_gpio_write_pin(s_pa_mute_dev, PA_MUTE_PIN, pa_mute_level(onoff ? false : true));
+#else
+    LOGI("PA %s", onoff ? "ON" : "OFF");
+    return lisa_gpio_write_pin(lisa_device_get(PA_GPIO_DEVICE), PA_PIN_NUM, onoff ? LISA_GPIO_HIGH : LISA_GPIO_LOW);
+#endif
 }
 
 /**
- * @brief 焦点变化回调 - 音乐播放器专用
+ * @brief   音量控制线程
+ * @param   arg 未使用
  *
- * @note 此回调仅用于监听焦点变化事件，不需要手动执行 pause/resume/stop
- *       app_player 会根据配置的 behavior 自动执行相应策略
- * @return false 表示让 app_player 执行默认策略，true 表示完全接管
+ * @note    等待信号量，收到信号后将 g_system_volume 应用到所有已创建的播放器。
+ *          异步设计避免在 TTS 播报期间阻塞调用者或与播放器内部状态冲突。
  */
-static bool music_focus_change_callback(app_player_t *player,
-                                        app_player_focus_state_t state,
-                                        app_player_t *by_which,
-                                        void *user_data)
+static void volume_thread_func(void *arg)
 {
-    const char *player_name = (const char *)user_data;
+    (void)arg;
 
-    switch (state) {
-        case APP_PLAYER_FOCUS_FOREGROUND:
-            LOGI("[%s] Got FOREGROUND focus (by player %p)", player_name, by_which);
+    while (1) {
+        /* 等待音量变更信号（阻塞，不消耗 CPU） */
+        if (xSemaphoreTake(g_volume_sem, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
 
-            // 如果是 tone 完成后恢复焦点，先不做任何操作
-            if (by_which == tone_player) {
-                LOGI("[%s] Tone completed, but waiting for TTS...", player_name);
-                // 返回 true 阻止自动恢复播放
-                return true;
-            }
-            break;
+        int volume = g_system_volume;
+        LOGI("Volume thread applying: %d", volume);
 
-        case APP_PLAYER_FOCUS_BACKGROUND:
-            LOGI("[%s] Moved to BACKGROUND (by player %p)", player_name, by_which);
-            break;
-
-        case APP_PLAYER_FOCUS_NONE:
-            LOGI("[%s] Lost focus (by player %p)", player_name, by_which);
-            break;
+        if (tone_player != NULL) {
+            app_player_set_volume(tone_player, volume);
+        }
+        if (tts_player != NULL) {
+            app_player_set_volume(tts_player, volume);
+        }
+        if (music_player != NULL) {
+            app_player_set_volume(music_player, volume);
+        }
+        if (alert_player != NULL) {
+            app_player_set_volume(alert_player, volume);
+        }
+#ifdef CONFIG_MINIAPP_BUZZER
+        if (miniapp_player != NULL) {
+            app_player_set_volume(miniapp_player, volume);
+        }
+#endif
     }
-
-    // 返回 false，让 app_player 根据配置自动执行策略
-    return false;
 }
 
 /**
- * @brief 焦点变化回调 - 通用版本
+ * @brief   从 KV 存储恢复系统音量并触发首次应用
+ *
+ * @note    在 voice_player_platform_init 末尾调用，
+ *          此时所有播放器和音量线程已就绪。
  */
-static bool focus_change_callback(app_player_t *player,
-                                   app_player_focus_state_t state,
-                                   app_player_t *by_which,
-                                   void *user_data)
+static void voice_player_system_volume_init(void)
 {
-    const char *player_name = (const char *)user_data;
+    int r;
 
-    switch (state) {
-        case APP_PLAYER_FOCUS_FOREGROUND:
-            LOGI("[%s] Got FOREGROUND focus (by player %p)", player_name, by_which);
-            break;
-
-        case APP_PLAYER_FOCUS_BACKGROUND:
-            LOGI("[%s] Moved to BACKGROUND (by player %p)", player_name, by_which);
-            break;
-
-        case APP_PLAYER_FOCUS_NONE:
-            LOGI("[%s] Lost focus (by player %p)", player_name, by_which);
-            break;
+    r = lisa_kv_get_int(KV_KEY_USER_VOLUME, &g_system_volume);
+    if (r != 0) {
+        LOGW("Failed to get system volume from kv, use default %d",
+             CONFIG_VOICE_PLAYER_DEFAULT_VOLUME);
+        g_system_volume = CONFIG_VOICE_PLAYER_DEFAULT_VOLUME;
+    } else {
+        if (g_system_volume > 100) {
+            g_system_volume = 100;
+        }
+        if (g_system_volume < 0) {
+            g_system_volume = 0;
+        }
     }
 
-    // 返回 false，让 app_player 根据配置自动执行策略
-    return false;
+    if (g_volume_sem != NULL) {
+        xSemaphoreGive(g_volume_sem);
+    }
 }
 
+
+/**
+ * @brief   初始化语音播放器平台
+ * @return  0 成功，-1 失败
+ *
+ * @note    创建 tone/tts/music/alert 四个播放器实例，配置音频焦点通道，
+ *          启动音量控制线程，并从 KV 恢复初始音量。
+ *          各播放器的业务回调由对应 voice_player 子模块注册。
+ */
 int voice_player_platform_init(void)
 {
     int ret = 0;
 
     LOGI("voice_player_platform_init...");
 
+#ifndef CONFIG_BOARD_ARCS_MINI3
     /* 初始化PA控制GPIO */
     lisa_device_t *gpio_dev = lisa_device_get(PA_GPIO_DEVICE);
     if (!lisa_device_ready(gpio_dev)) {
@@ -252,6 +193,14 @@ int voice_player_platform_init(void)
         LOGE("GPIO configure failed: %d", ret);
         return -1;
     }
+#else
+    /* PA mute 走 CH32 EXGPIO，外挂 MCU 未就绪时降级继续（pa_control_callback
+     * 每次开关 PA 都会重试初始化），不能因此中断整个播放器平台初始化 */
+    ret = pa_mute_hw_init();
+    if (ret != 0) {
+        LOGW("PA mute GPIO init failed, continue without PA mute control: %d", ret);
+    }
+#endif
 
     /* 定义焦点通道配置 */
     app_player_focus_channel_config_t focus_configs[] = {
@@ -282,7 +231,7 @@ int voice_player_platform_init(void)
             .capture_count = 0,
             .behavior = {
                 .on_background = APP_PLAYER_FOCUS_LOSS_PAUSE,
-                .on_focus_lost = APP_PLAYER_FOCUS_LOSS_STOP,
+                .on_focus_lost = APP_PLAYER_FOCUS_LOSS_PAUSE,
             }
         },
         {
@@ -294,14 +243,26 @@ int voice_player_platform_init(void)
                 .on_background = APP_PLAYER_FOCUS_LOSS_PAUSE,
                 .on_focus_lost = APP_PLAYER_FOCUS_LOSS_STOP,
             }
-        }
+        },
+#ifdef CONFIG_MINIAPP_BUZZER
+        {
+            .name = "miniapp",
+            .priority = 45,
+            .capture_names = NULL,
+            .capture_count = 0,
+            .behavior = {
+                .on_background = APP_PLAYER_FOCUS_LOSS_STOP,
+                .on_focus_lost = APP_PLAYER_FOCUS_LOSS_STOP,
+            }
+        },
+#endif
     };
 
     /* 初始化 app_player 模块（带焦点管理） */
     app_player_config_t app_config = {
         .pa_ctrl_callback = pa_control_callback,
         .focus_configs = focus_configs,
-        .focus_config_count = 4
+        .focus_config_count = sizeof(focus_configs) / sizeof(focus_configs[0])
     };
 
     ret = app_player_init(&app_config);
@@ -333,180 +294,113 @@ int voice_player_platform_init(void)
         LOGE("Failed to create alert player");
         return -1;
     }
+#ifdef CONFIG_MINIAPP_BUZZER
+    miniapp_player = app_player_create("miniapp");
+    if (miniapp_player == NULL) {
+        LOGE("Failed to create miniapp player");
+        return -1;
+    }
+#endif
 
-    /* 注册事件回调 */
-    app_player_register_callback(music_player, player_event_callback, "MUSIC");
+    /* 创建音量控制线程 */
+    g_volume_sem = xSemaphoreCreateBinary();
+    if (g_volume_sem == NULL) {
+        LOGE("Failed to create volume semaphore");
+        return -1;
+    }
+    xTaskCreate(volume_thread_func, "volctrl", 1024, NULL, 3, &g_volume_thread);
+    if (g_volume_thread == NULL) {
+        LOGE("Failed to create volume thread");
+        vSemaphoreDelete(g_volume_sem);
+        g_volume_sem = NULL;
+        return -1;
+    }
 
-    /* 注册焦点变化回调 */
-    app_player_register_focus_cb(music_player, music_focus_change_callback, "MUSIC");
-
+    /* 音量初始化 */
     voice_player_system_volume_init();
+
     return 0;
 }
 
-int voice_player_play_array(const struct voice_msg_audio_item *items, int count)
+/**
+ * @brief   判断指定播放器是否处于活跃音频播放管线中
+ * @param   player 播放器实例
+ * @return  true 活跃（准备中/已准备/播放中），false 非活跃或 player 为 NULL
+ */
+static bool voice_player_state_is_audio_active(app_player_t *player)
 {
-    if (items == NULL || count <= 0) {
-        LOGE("Invalid parameters");
-        return -1;
+    if (player == NULL) {
+        return false;
     }
 
-    if (count > MAX_PLAYLIST_SIZE) {
-        LOGW("Playlist size %d exceeds max %d, truncating", count, MAX_PLAYLIST_SIZE);
-        count = MAX_PLAYLIST_SIZE;
+    switch (app_player_get_state(player)) {
+    case APP_PLAYER_STATE_PREPARING:
+    case APP_PLAYER_STATE_PREPARED:
+    case APP_PLAYER_STATE_PLAYING:
+        return true;
+    default:
+        return false;
     }
-
-    // 停止当前播放
-    app_player_stop(music_player);
-
-    // 清空并重建播放列表
-    memset(&g_playlist, 0, sizeof(g_playlist));
-    g_playlist.count = count;
-    g_playlist.current_index = -1;
-
-    // 复制音频项到播放列表
-    for (int i = 0; i < count; i++) {
-        memcpy(g_playlist.items[i].id, items[i].id, sizeof(g_playlist.items[i].id));
-        memcpy(g_playlist.items[i].name, items[i].name, sizeof(g_playlist.items[i].name));
-        g_playlist.items[i].playable = items[i].playable;
-
-        LOGI("Playlist[%d]: %s - %s (playable: %d)",
-             i, g_playlist.items[i].name, g_playlist.items[i].id, g_playlist.items[i].playable);
-    }
-
-    // 播放第一首
-    return playlist_play_index(0);
 }
 
-int voice_player_play_next(void)
+/**
+ * @brief   判断音乐播放器是否处于活跃音频播放管线中
+ * @return  true 活跃（准备中/已准备/播放中），false 非活跃
+ */
+bool voice_player_is_music_active(void)
 {
-    if (g_playlist.count == 0) {
-        LOGW("Playlist is empty");
-        return -1;
-    }
-
-    int next_index = g_playlist.current_index + 1;
-    if (next_index >= g_playlist.count) {
-        LOGI("Already at last track, wrapping to first");
-        next_index = 0;
-    }
-
-    return playlist_play_index(next_index);
+    return voice_player_state_is_audio_active(music_player);
 }
 
-int voice_player_play_prev(void)
+/**
+ * @brief   判断任一播放器是否处于活跃音频播放管线中
+ * @return  true 有任一播放器活跃，false 全部空闲
+ */
+bool voice_player_is_audio_active(void)
 {
-    if (g_playlist.count == 0) {
-        LOGW("Playlist is empty");
-        return -1;
-    }
-
-    int prev_index = g_playlist.current_index - 1;
-    if (prev_index < 0) {
-        LOGI("Already at first track, wrapping to last");
-        prev_index = g_playlist.count - 1;
-    }
-
-    return playlist_play_index(prev_index);
+    return voice_player_state_is_audio_active(tone_player) ||
+           voice_player_state_is_audio_active(tts_player) ||
+           voice_player_state_is_audio_active(music_player) ||
+           voice_player_state_is_audio_active(alert_player)
+#ifdef CONFIG_MINIAPP_BUZZER
+           || voice_player_state_is_audio_active(miniapp_player)
+#endif
+           ;
 }
 
-int voice_player_replay_current(void)
-{
-    if (g_playlist.count == 0) {
-        LOGW("Playlist is empty");
-        return -1;
-    }
 
-    if (g_playlist.current_index < 0) {
-        LOGW("No current track");
-        return -1;
-    }
 
-    return playlist_play_index(g_playlist.current_index);
-}
-
+/**
+ * @brief   设置系统音量（异步）
+ * @param   volume 音量值（0-100）
+ * @return  0 成功，-1 参数无效
+ *
+ * @note    异步接口：保存音量值并通知后台线程应用，立即返回。
+ *          不持久化 KV——KV 管理由 service_volume 层负责。
+ *          0-100 为硬件安全边界，业务策略（如 min_volume）由上层处理。
+ */
 int voice_player_set_system_volume(int volume)
 {
-    // 参数校验
     if (volume < 0 || volume > 100) {
         LOGE("Invalid volume: %d (valid range: 0-100)", volume);
         return -1;
     }
 
     LOGI("Setting system volume to %d", volume);
-
-    // 保存系统音量
     g_system_volume = volume;
 
-    int ret = 0;
-    int failed_count = 0;
-
-    // 设置所有已创建的播放器音量
-    if (tone_player != NULL) {
-        int r = app_player_set_volume(tone_player, volume);
-        if (r != APP_PLAYER_OK) {
-            LOGE("Failed to set tone player volume: %d", r);
-            failed_count++;
-        }
+    if (g_volume_sem != NULL) {
+        xSemaphoreGive(g_volume_sem);
     }
 
-    if (tts_player != NULL) {
-        int r = app_player_set_volume(tts_player, volume);
-        if (r != APP_PLAYER_OK) {
-            LOGE("Failed to set tts player volume: %d", r);
-            failed_count++;
-        }
-    }
-
-    if (music_player != NULL) {
-        int r = app_player_set_volume(music_player, volume);
-        if (r != APP_PLAYER_OK) {
-            LOGE("Failed to set music player volume: %d", r);
-            failed_count++;
-        }
-    }
-
-    if (alert_player != NULL) {
-        int r = app_player_set_volume(alert_player, volume);
-        if (r != APP_PLAYER_OK) {
-            LOGE("Failed to set alert player volume: %d", r);
-            failed_count++;
-        }
-    }
-
-    if (failed_count > 0) {
-        LOGW("Failed to set volume for %d player(s)", failed_count);
-        return -1;
-    }
-
-    lisa_kv_set_int(KV_KEY_USER_VOLUME, g_system_volume);
-
-    LOGI("System volume set to %d successfully", volume);
     return 0;
 }
 
+/**
+ * @brief   获取当前系统音量
+ * @return  音量值（0-100）
+ */
 int voice_player_get_system_volume(void)
 {
     return g_system_volume;
-}
-
-void voice_player_system_volume_init(void)
-{
-    int r;
-
-	r = lisa_kv_get_int(KV_KEY_USER_VOLUME, &g_system_volume);
-	if (r != 0) {
-        LOGW("Failed to get system volume from kv, use default value 70");
-		g_system_volume = 70;
-	} else {
-		if (g_system_volume > 100) {
-			g_system_volume = 100;
-		}
-
-		if (g_system_volume < 0) {
-			g_system_volume = 0;
-		}
-	}
-
-    voice_player_set_system_volume(g_system_volume);
 }

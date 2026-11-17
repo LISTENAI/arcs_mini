@@ -1,46 +1,48 @@
+# set(PLAYER_SRC ON)
+option(LISA_PLAYER_DECODE_LOG_AUDIO_CACHE
+    "Enable lisa_player decode audio cache logging"
+    OFF)
 
 if (DEFINED CONFIG_SDK_MODULE_LISA_PLAYER)
-    if (CONFIG_SDK_MODULE_LISA_PLAYER_SOURCE_CODE)
-        message(STATUS "lisa player source code")
-        if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/lisa_player/.git)
-            execute_process(
-                COMMAND git clone ${CONFIG_SDK_MODULE_LISA_PLAYER_SOURCE_CODE_URL} lisa_player
-                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                RESULT_VARIABLE GIT_CLONE_RESULT
-            )
-            if (NOT GIT_CLONE_RESULT EQUAL 0)
-                message(FATAL_ERROR "Failed to clone lisa_player repository")
-            endif()
-        endif()
-
-        execute_process(
-            COMMAND git fetch --unshallow
-            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lisa_player
-            ERROR_QUIET
-        )
-        execute_process(
-            COMMAND git fetch origin
-            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lisa_player
-        )
-        execute_process(
-            COMMAND git checkout ${CONFIG_SDK_MODULE_LISA_PLAYER_SOURCE_CODE_REVERSION}
-            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lisa_player
-            RESULT_VARIABLE GIT_CHECKOUT_RESULT
-        )
-        if (NOT GIT_CHECKOUT_RESULT EQUAL 0)
-            message(FATAL_ERROR "Failed to checkout lisa_player commit: ${CONFIG_SDK_MODULE_LISA_PLAYER_SOURCE_CODE_REVERSION}")
-        endif()
-
-        add_subdirectory(lisa_player)
-    else()
+    if (NOT DEFINED PLAYER_SRC)
         listenai_link_libraries(m)
-        if (CONFIG_4G_MODULE)
-            listenai_link_libraries(${CMAKE_CURRENT_SOURCE_DIR}/liblisa_player_4g.a)
-            listenai_link_libraries(${CMAKE_CURRENT_SOURCE_DIR}/libplatform_track_4g.a)
-        else()
-            listenai_link_libraries(${CMAKE_CURRENT_SOURCE_DIR}/liblisa_player.a)
-            listenai_link_libraries(${CMAKE_CURRENT_SOURCE_DIR}/libplatform_track.a)
+        # The prebuilt HTTP receiver gives up after six 500 ms socket timeouts.
+        # Keep the vendor archive unchanged and make only _recv overridable so
+        # app_player can tolerate delayed stream_tts data.
+        set(LISA_PLAYER_PATCHED_LIBRARY
+            "${CMAKE_CURRENT_BINARY_DIR}/liblisa_player_http_override.a")
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/liblisa_player.a"
+            "${LISA_PLAYER_PATCHED_LIBRARY}"
+            COPYONLY)
+        execute_process(
+            COMMAND "${CMAKE_OBJCOPY}" --weaken-symbol=_recv
+                    "${LISA_PLAYER_PATCHED_LIBRARY}"
+            RESULT_VARIABLE LISA_PLAYER_OBJCOPY_RESULT)
+        if (NOT LISA_PLAYER_OBJCOPY_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to make lisa_player _recv overridable: ${LISA_PLAYER_OBJCOPY_RESULT}")
         endif()
-        listenai_include_directories(./)
+
+        listenai_link_libraries(${LISA_PLAYER_PATCHED_LIBRARY})
+        listenai_link_libraries(${CMAKE_CURRENT_SOURCE_DIR}/libplatform_track.a)
+    else()
+        # 如果定义了 PLAYER_SRC，则编译源码，并在构建完成后更新当前目录的预编译库
+        add_subdirectory(lisa_player)
+        if (CONFIG_SDK_MODULE_LISA_PLAYER_DECODE_LOG_AUDIO_CACHE OR LISA_PLAYER_DECODE_LOG_AUDIO_CACHE)
+            target_compile_definitions(lisa_player PRIVATE LISA_PLAYER_DECODE_LOG_AUDIO_CACHE)
+        endif()
+        add_custom_target(lisa_player_copy_libraries ALL
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "$<TARGET_FILE:lisa_player>"
+                "${CMAKE_CURRENT_SOURCE_DIR}/liblisa_player.a"
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "$<TARGET_FILE:platform_track>"
+                "${CMAKE_CURRENT_SOURCE_DIR}/libplatform_track.a"
+            COMMENT "Copy lisa_player libraries back to ${CMAKE_CURRENT_SOURCE_DIR}"
+            VERBATIM
+        )
+        add_dependencies(lisa_player_copy_libraries lisa_player platform_track)
     endif()
+    listenai_include_directories(./)
 endif()

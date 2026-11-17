@@ -49,11 +49,19 @@
 /* 显示电量持久化：图标换挡时（每 10% 一档）写 KV，重启后恢复上次显示值 */
 #define BATTERY_PCT_KV_KEY "bat_ui_pct"
 
+#define BATTERY_FULL_PERCENTAGE (100)
+
 static lisa_timer_t *battery_ui_timer __psram_bss__ = NULL;
+static volatile bool s_battery_sampling_suspended __psram_bss__ = false;
 
 /* 滤波器核心状态提升到模块级，以便 battery_ui_init() 从 KV 注入初值 */
 static uint8_t s_output_pct __psram_data__ = 0xFF;
 static uint8_t s_target_pct __psram_data__ = 0xFF;
+static voice_msg_battery_info_t s_last_battery_info __psram_bss__ = {
+    .level = 0,
+    .status = VOICE_MSG_BATTERY_STATUS_UNKNOWN,
+};
+static bool s_last_battery_info_valid __psram_bss__ = false;
 
 /**
  * @brief 百分比去抖/平滑滤波
@@ -154,10 +162,50 @@ static voice_msg_battery_status_t battery_status_to_msg(battery_status_t status)
     }
 }
 
+static uint8_t battery_percentage_for_status(uint8_t percentage, battery_status_t status)
+{
+    if (status == BATTERY_STATUS_CHARGE_DONE) {
+        return BATTERY_FULL_PERCENTAGE;
+    }
+
+    return percentage;
+}
+
+bool battery_ui_get_info(voice_msg_battery_info_t *info)
+{
+    if (!info) {
+        return false;
+    }
+
+    if (s_last_battery_info_valid) {
+        *info = s_last_battery_info;
+        return true;
+    }
+
+    battery_status_t status = battery_get_status();
+    bool plug_in_pending = battery_usb_plugged_stable_get() && status == BATTERY_STATUS_NOT_CONNECT;
+
+    battery_status_t display_status = plug_in_pending ? BATTERY_STATUS_CHARGING : status;
+    uint8_t percentage = (s_output_pct != 0xFF) ? s_output_pct : battery_get_pct_raw();
+
+    info->level = battery_percentage_for_status(percentage, display_status);
+    info->status = battery_status_to_msg(display_status);
+
+    return true;
+}
+
 static void battery_voltage_sample_cb(struct lisa_timer *timer)
 {
+    if (s_battery_sampling_suspended) {
+        return;
+    }
+
     uint8_t sampled_percentage = battery_get_pct_raw();
     battery_status_t status    = battery_get_status();
+    uint16_t voltage_mv        = battery_get_voltage_mv();
+#ifdef CONFIG_LISA_CH32V003_ADC
+    (void)battery_get_temp_adc_raw();
+#endif
     bool is_charging           = (status == BATTERY_STATUS_CHARGING || status == BATTERY_STATUS_CHARGE_DONE);
     uint8_t raw_percentage     = percentage_debounce_filter(sampled_percentage);
 
@@ -195,11 +243,15 @@ static void battery_voltage_sample_cb(struct lisa_timer *timer)
     }
 
     battery_status_t display_status = plug_in_pending ? BATTERY_STATUS_CHARGING : status;
+    display_percentage = battery_percentage_for_status(display_percentage, display_status);
 
     voice_msg_battery_info_t msg = {
         .level  = display_percentage,
         .status = battery_status_to_msg(display_status),
     };
+
+    s_last_battery_info = msg;
+    s_last_battery_info_valid = true;
 
     if (display_percentage != last_percentage || display_status != last_publish_status) {
         voice_msg_pub(VOICE_MSG_POWER_BATTERY_UPDATE, &msg, sizeof(msg));
@@ -219,10 +271,30 @@ static void battery_voltage_sample_cb(struct lisa_timer *timer)
 
     last_logic_status = status;
 
-    LISA_LOGD(TAG, "Battery: sampled=%d%%, filtered=%d%%, display=%d%%, status=%d, ui_status=%d, hold=%d",
-              sampled_percentage, raw_percentage, display_percentage, status, display_status, charge_hold_ticks);
+    LISA_LOGD(TAG, "Battery UI: ui_level=%u%%, voltage=%umV, sampled=%u%%, filtered=%u%%, "
+              "status=%d, ui_status=%d, hold=%u",
+              display_percentage, voltage_mv, sampled_percentage, raw_percentage,
+              status, display_status, charge_hold_ticks);
 
-    lisa_timer_start(battery_ui_timer);
+    if (!s_battery_sampling_suspended) {
+        lisa_timer_start(battery_ui_timer);
+    }
+}
+
+void battery_ui_set_sampling_suspended(bool suspended)
+{
+    s_battery_sampling_suspended = suspended;
+
+    if (battery_ui_timer) {
+        if (suspended) {
+            lisa_timer_stop(battery_ui_timer);
+        } else {
+            lisa_timer_start(battery_ui_timer);
+        }
+    }
+
+    LISA_LOGI(TAG, "Battery timer %s",
+              suspended ? "stopped during standby" : "restored");
 }
 
 void battery_ui_init(void)

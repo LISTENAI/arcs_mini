@@ -17,6 +17,7 @@
 #include <lisa_log.h>
 
 static int panel_send_data_with_sram_rotate(lisa_display_panel_t *panel, uint16_t x, uint16_t y, uint16_t w, uint16_t h, const void *bitmap);
+static int panel_send_data_with_sram_rotate_180(lisa_display_panel_t *panel, uint16_t w, uint16_t h, const void *bitmap);
 
 static inline void reverse_buffer_bytes(uint8_t *buf, int start, int end)
 {
@@ -29,7 +30,7 @@ static inline void reverse_buffer_bytes(uint8_t *buf, int start, int end)
     }
 }
 
-static void panle_prepare_cmd_buffer(const void *cmd, uint8_t cmd_bits)
+static void panel_prepare_cmd_buffer(const void *cmd, uint8_t cmd_bits)
 {
     uint8_t *from = (uint8_t *)cmd;
     if (cmd_bits > 8) {
@@ -45,46 +46,62 @@ int panel_write_cmd_data(lisa_display_panel_t *panel, int cmd, uint8_t cmd_bits,
         return LISA_DEVICE_ERR_NOT_READY;
     }
 
-    panle_prepare_cmd_buffer(&cmd, cmd_bits);
+    if (panel->bus_mutex) {
+        lisa_mutex_lock(panel->bus_mutex, -1);
+    }
 
+    panel_prepare_cmd_buffer(&cmd, cmd_bits);
+
+    int ret;
     if (panel->cmd_bus_dev) {
         lisa_display_cmd_bus_api_t *api = panel->cmd_bus_dev->api;
-        int ret = api->write_cmd(cmd, cmd_bits, data, len);
-        return ret;
+        ret = api->write_cmd(cmd, cmd_bits, data, len);
+    } else {
+        lisa_display_bus_api_t *bus_api = (lisa_display_bus_api_t *)panel->bus_dev->api;
+        bus_api->transfer_control(panel->bus_dev, true);
+        ret = bus_api->trans_cmd_data(panel->bus_dev, cmd, cmd_bits, data, len);
+        bus_api->transfer_control(panel->bus_dev, false);
     }
-    
-    lisa_display_bus_api_t *bus_api = (lisa_display_bus_api_t *)panel->bus_dev->api;
-    bus_api->transfer_control(panel->bus_dev, true);
-    int ret = bus_api->trans_cmd_data(panel->bus_dev, cmd, cmd_bits, data, len);
-    bus_api->transfer_control(panel->bus_dev, false);
 
+    if (panel->bus_mutex) {
+        lisa_mutex_unlock(panel->bus_mutex);
+    }
     return ret;
 }
 
 int panel_draw_pixels(lisa_display_panel_t *panel, uint32_t cmd, uint16_t cmd_bits, uint16_t x, uint16_t y, uint16_t w, uint16_t h, const void *pixels)
 {
-    int ret = 0;
-
     if (!panel || !panel->bus_dev) {
         return LISA_DEVICE_ERR_NOT_READY;
     }
 
+    if (panel->bus_mutex) {
+        lisa_mutex_lock(panel->bus_mutex, -1);
+    }
+
+    int ret = 0;
     if (cmd_bits > 0) {
-        panle_prepare_cmd_buffer(&cmd, cmd_bits);
+        panel_prepare_cmd_buffer(&cmd, cmd_bits);
     }
 
     lisa_display_bus_api_t *bus_api = (lisa_display_bus_api_t *)panel->bus_dev->api;
 #if CONFIG_DCACHE_ENABLE
-	dcache_clean_range((size_t)pixels, (size_t)pixels + ((size_t)w * h * 2));
+    dcache_clean_range((size_t)pixels, (size_t)pixels + ((size_t)w * h * 2));
 #endif
     bus_api->transfer_control(panel->bus_dev, true);
     ret = bus_api->trans_cmd_data(panel->bus_dev, cmd, cmd_bits, NULL, 0);
     if (ret != LISA_DEVICE_OK) {
         bus_api->transfer_control(panel->bus_dev, false);
+        if (panel->bus_mutex) {
+            lisa_mutex_unlock(panel->bus_mutex);
+        }
         return ret;
     }
 
-    if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_90 ||
+    if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_180) {
+        ret = panel_send_data_with_sram_rotate_180(panel, w, h, pixels);
+    }
+    else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_90 ||
         panel->caps.orientation == LISA_DISPLAY_ORIENTATION_270) {
         ret = panel_send_data_with_sram_rotate(panel, x, y, w, h, pixels);
     }
@@ -92,16 +109,25 @@ int panel_draw_pixels(lisa_display_panel_t *panel, uint32_t cmd, uint16_t cmd_bi
         ret = bus_api->write_pixels(panel->bus_dev, pixels, (size_t)w * h * 2);
         if (ret != LISA_DEVICE_OK) {
             bus_api->transfer_control(panel->bus_dev, false);
+            if (panel->bus_mutex) {
+                lisa_mutex_unlock(panel->bus_mutex);
+            }
             return ret;
         }
-        ret  = bus_api->wait_for_completion(panel->bus_dev, 1000);
+        ret = bus_api->wait_for_completion(panel->bus_dev, 1000);
         if (ret != LISA_DEVICE_OK) {
             bus_api->transfer_control(panel->bus_dev, false);
+            if (panel->bus_mutex) {
+                lisa_mutex_unlock(panel->bus_mutex);
+            }
             return ret;
         }
     }
     bus_api->transfer_control(panel->bus_dev, false);
 
+    if (panel->bus_mutex) {
+        lisa_mutex_unlock(panel->bus_mutex);
+    }
     return ret;
 }
 
@@ -115,13 +141,8 @@ int panel_set_backlight_brightness(lisa_display_backlight_t *backlight, uint8_t 
     case LISA_DISPLAY_BACKLIGHT_TYPE_PWM: {
         lisa_display_backlight_pwm_config_t *pwm = &backlight->config.pwm;
         if (pwm->dev) {
-            if (brightness == 0) {
-                lisa_pwm_disable(pwm->dev, pwm->channel);
-                return LISA_DEVICE_OK;
-            }
-
-            if (brightness >= 100) {
-                brightness = 99;
+            if (brightness > 100) {
+                brightness = 100;
             }
             lisa_pwm_config_t config = { .polarity = LISA_PWM_POLARITY_INVERTED };
             if (backlight->blacklight_polarity == LISA_DISPLAY_BLACKLIGHT_POLARITY_HIGH) {
@@ -195,13 +216,17 @@ void panel_set_mem_area(lisa_display_panel_t *panel, lisa_display_panel_mem_area
         return;
     }
 
-    if (panel->caps.orientation  == LISA_DISPLAY_ORIENTATION_90) {
+    if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_90) {
         new_x = area->panel_w - (area->y + area->h);
         new_y = area->x;
         new_w = area->h;
         new_h = area->w;
-    }
-    else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_270) {
+    } else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_180) {
+        new_x = area->panel_w - area->x - area->w;
+        new_y = area->panel_h - area->y - area->h;
+        new_w = area->w;
+        new_h = area->h;
+    } else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_270) {
         new_x = area->y;
         new_y = area->panel_h - area->x - area->w;
         new_w = area->h;
@@ -244,96 +269,190 @@ void panel_set_mem_area(lisa_display_panel_t *panel, lisa_display_panel_mem_area
 #include <dma.h>
 #endif
 
-typedef struct {
-#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
-    lisa_semaphore_t *cpdma_done_sem;
-#endif
-    uint16_t rotate_buf_ping[ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH];
-    uint16_t rotate_buf_pong[ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH];
-} panel_rotate_ctx_t;
-
-static panel_rotate_ctx_t g_rotate_ctx;
-
-
 #if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
 #include "sysutils.h"
-__dtcm_bss__ DMA_LLI dma_llp_lists[ROTATE_BUF_MAX_HEIGHT];
+#endif
 
+typedef struct {
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+    lisa_semaphore_t *cpdma_done_sem;  /**< CPDMA 完成信号量 */
+    DMA_LLI *dma_llp_lists;            /**< 指向 DTCM 中的 DMA 链表数组 */
+    uint8_t dma_channel;               /**< 分配的 DMA 通道号 */
+    volatile uint8_t dma_event;
+#endif
+    lisa_mutex_t *rotate_mutex;        /**< 旋转缓冲区互斥锁（保护旋转资源）*/
+    uint16_t rotate_buf_ping[ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH];  /**< Ping 缓冲区 */
+    uint16_t rotate_buf_pong[ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH];  /**< Pong 缓冲区 */
+} panel_rotate_ctx_t;
+
+#if CONFIG_LISA_DISPLAY_DUAL_INDEPENDENT_ROTATE
+static panel_rotate_ctx_t g_rotate_ctx[2];
+static bool g_rotate_ctx_initialized[2] = {false, false};
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+__dtcm_bss__ static DMA_LLI g_dma_llp_lists_0[ROTATE_BUF_MAX_HEIGHT];
+__dtcm_bss__ static DMA_LLI g_dma_llp_lists_1[ROTATE_BUF_MAX_HEIGHT];
+#endif
+#else
+static panel_rotate_ctx_t g_rotate_ctx[1];
+static bool g_rotate_ctx_initialized[1] = {false};
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+__dtcm_bss__ static DMA_LLI g_dma_llp_lists_0[ROTATE_BUF_MAX_HEIGHT];
+#endif
+#endif
+
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
 static void rotate_dma_drv_event(uint32_t event_info, uint32_t xfer_bytes, uint32_t usr_param)
 {
     panel_rotate_ctx_t *ctx = (panel_rotate_ctx_t *)usr_param;
-    lisa_semaphore_give(ctx->cpdma_done_sem);
+    if (event_info & (DMA_EVENT_TRANSFER_COMPLETE | DMA_EVENT_ERROR)) {
+        ctx->dma_event = (uint8_t)event_info;
+        lisa_semaphore_give(ctx->cpdma_done_sem);
+    }
 }
 #endif
 
 
-int panel_rotate_init(void)
+int panel_rotate_init(lisa_display_panel_t *panel)
 {
-#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
-    g_rotate_ctx.cpdma_done_sem = lisa_semaphore_create(1);
-    if (!g_rotate_ctx.cpdma_done_sem) {
-        return LISA_DEVICE_ERR_NO_MEM;
+#if CONFIG_LISA_DISPLAY_DUAL_INDEPENDENT_ROTATE
+    /* 确定实例 ID：查找此 panel 在私有数组中的位置 */
+    int inst = -1;
+    if (panel == arcs_display_priv0.panel) {
+        inst = 0;
     }
-    dma_initialize();
-    dma_channel_reserve(CONFIG_LISA_DISPLAY_CPDMA_CH, rotate_dma_drv_event, (uint32_t)(&g_rotate_ctx), DMA_CACHE_SYNC_AUTO);
+#ifdef CONFIG_LISA_DUAL_DISPLAY
+    else if (panel == arcs_display_priv1.panel) {
+        inst = 1;
+    }
 #endif
+
+    if (inst < 0) {
+        LISA_LOGE(LOG_TAG, "Panel instance not found for rotate init");
+        return LISA_DEVICE_ERR_INVALID;
+    }
+
+    if (!g_rotate_ctx_initialized[inst]) {
+        g_rotate_ctx[inst].rotate_mutex = lisa_mutex_create();
+        if (!g_rotate_ctx[inst].rotate_mutex) {
+            LISA_LOGE(LOG_TAG, "Failed to create rotate mutex for instance %d", inst);
+            return LISA_DEVICE_ERR_NO_MEM;
+        }
+
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+        g_rotate_ctx[inst].cpdma_done_sem = lisa_semaphore_create(1);
+        if (!g_rotate_ctx[inst].cpdma_done_sem) {
+            lisa_mutex_delete(g_rotate_ctx[inst].rotate_mutex);
+            g_rotate_ctx[inst].rotate_mutex = NULL;
+            return LISA_DEVICE_ERR_NO_MEM;
+        }
+
+        g_rotate_ctx[inst].dma_llp_lists = (inst == 0) ? g_dma_llp_lists_0 : g_dma_llp_lists_1;
+        g_rotate_ctx[inst].dma_channel = (inst == 0) ? CONFIG_LISA_DISPLAY_CPDMA_CH : CONFIG_LISA_DISPLAY_CPDMA_CH_1;
+
+        if (inst == 0) {
+            dma_initialize();
+        }
+
+        dma_channel_reserve(g_rotate_ctx[inst].dma_channel, rotate_dma_drv_event,
+                            (uint32_t)(&g_rotate_ctx[inst]), DMA_CACHE_SYNC_AUTO);
+#endif
+        g_rotate_ctx_initialized[inst] = true;
+        LISA_LOGI(LOG_TAG, "Rotate context %d initialized (independent)", inst);
+    }
+
+    panel->rotate_ctx = &g_rotate_ctx[inst];
+    s_inst_counter++;
+
+#else
+    if (!g_rotate_ctx_initialized[0]) {
+        g_rotate_ctx[0].rotate_mutex = lisa_mutex_create();
+        if (!g_rotate_ctx[0].rotate_mutex) {
+            LISA_LOGE(LOG_TAG, "Failed to create rotate mutex");
+            return LISA_DEVICE_ERR_NO_MEM;
+        }
+
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+        g_rotate_ctx[0].cpdma_done_sem = lisa_semaphore_create(1);
+        if (!g_rotate_ctx[0].cpdma_done_sem) {
+            lisa_mutex_delete(g_rotate_ctx[0].rotate_mutex);
+            g_rotate_ctx[0].rotate_mutex = NULL;
+            return LISA_DEVICE_ERR_NO_MEM;
+        }
+        g_rotate_ctx[0].dma_llp_lists = g_dma_llp_lists_0;
+        g_rotate_ctx[0].dma_channel = CONFIG_LISA_DISPLAY_CPDMA_CH;
+        dma_initialize();
+        dma_channel_reserve(g_rotate_ctx[0].dma_channel, rotate_dma_drv_event,
+                            (uint32_t)(&g_rotate_ctx[0]), DMA_CACHE_SYNC_AUTO);
+#endif
+        g_rotate_ctx_initialized[0] = true;
+        LISA_LOGI(LOG_TAG, "Rotate context initialized (shared)");
+    }
+
+    panel->rotate_ctx = &g_rotate_ctx[0];
+#endif
+
     return LISA_DEVICE_OK;
 }
 
 #if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
-static void _panel_dma_rotate(const uint16_t *src_buf, uint16_t src_buf_w,
-                              uint16_t *dst_buf, uint16_t area_w, uint16_t area_h,
-                              lisa_display_orientation_t orientation)
+static void panel_dma_rotate(panel_rotate_ctx_t *ctx, const uint16_t *src_buf, uint16_t src_buf_w, uint16_t *dst_buf, uint16_t area_w, uint16_t area_h, lisa_display_orientation_t orientation)
 {
     uint16_t link_size = area_h;
     uint32_t control, config_low, config_high;
 
     if (orientation == LISA_DISPLAY_ORIENTATION_90) {
-        control = DMA_CH_CTLL_INT_EN | DMA_CH_CTLL_DST_WIDTH(DMA_WIDTH_HALFWORD) |
-                  DMA_CH_CTLL_SRC_WIDTH(DMA_WIDTH_HALFWORD) | DMA_CH_CTLL_DST_INC | DMA_CH_CTLL_SRC_INC |
-                  DMA_CH_CTLL_DST_BSIZE(DMA_BSIZE_1) | DMA_CH_CTLL_SRC_BSIZE(DMA_BSIZE_16) | DMA_CH_CTLL_TTFC_M2M |
-                  DMA_CH_CTLL_DMS(0) | DMA_CH_CTLL_SMS(0);
-    } else { /* 270 */
-        control = DMA_CH_CTLL_INT_EN | DMA_CH_CTLL_DST_WIDTH(DMA_WIDTH_HALFWORD) |
-                  DMA_CH_CTLL_SRC_WIDTH(DMA_WIDTH_HALFWORD) | DMA_CH_CTLL_DST_DEC | DMA_CH_CTLL_SRC_INC |
-                  DMA_CH_CTLL_DST_BSIZE(DMA_BSIZE_1) | DMA_CH_CTLL_SRC_BSIZE(DMA_BSIZE_16) | DMA_CH_CTLL_TTFC_M2M |
-                  DMA_CH_CTLL_DMS(0) | DMA_CH_CTLL_SMS(0);
+        control = DMA_CH_CTLL_INT_EN | DMA_CH_CTLL_DST_WIDTH(DMA_WIDTH_HALFWORD) | DMA_CH_CTLL_SRC_WIDTH(DMA_WIDTH_HALFWORD) |
+                  DMA_CH_CTLL_DST_INC | DMA_CH_CTLL_SRC_INC | DMA_CH_CTLL_DST_BSIZE(DMA_BSIZE_1) |
+                  DMA_CH_CTLL_SRC_BSIZE(DMA_BSIZE_16) | DMA_CH_CTLL_TTFC_M2M | DMA_CH_CTLL_DMS(0) | DMA_CH_CTLL_SMS(0);
+    } else {
+        control = DMA_CH_CTLL_INT_EN | DMA_CH_CTLL_DST_WIDTH(DMA_WIDTH_HALFWORD) | DMA_CH_CTLL_SRC_WIDTH(DMA_WIDTH_HALFWORD) |
+                  DMA_CH_CTLL_DST_DEC | DMA_CH_CTLL_SRC_INC | DMA_CH_CTLL_DST_BSIZE(DMA_BSIZE_1) |
+                  DMA_CH_CTLL_SRC_BSIZE(DMA_BSIZE_16) | DMA_CH_CTLL_TTFC_M2M | DMA_CH_CTLL_DMS(0) | DMA_CH_CTLL_SMS(0);
     }
     control |= DMA_CH_CTLL_D_SCAT_EN;
     config_low = DMA_CH_CFGL_CH_PRIOR(0);
     config_high = DMA_CH_CFGH_FIFO_MODE;
 
     for (uint32_t i = 0; i < link_size; i++) {
-        dma_llp_lists[i].SAR = (uint32_t)(src_buf + src_buf_w * i);
+        ctx->dma_llp_lists[i].SAR = (uint32_t)(src_buf + src_buf_w * i);
         if (orientation == LISA_DISPLAY_ORIENTATION_90) {
-            dma_llp_lists[i].DAR = (uint32_t)(dst_buf + (link_size - 1 - i));
+            ctx->dma_llp_lists[i].DAR = (uint32_t)(dst_buf + (link_size - 1 - i));
         } else { /* 270 */
-            dma_llp_lists[i].DAR = (uint32_t)(dst_buf + (area_w - 1) * link_size + i);
+            ctx->dma_llp_lists[i].DAR = (uint32_t)(dst_buf + (area_w - 1) * link_size + i);
         }
-        dma_llp_lists[i].LLP = (uint32_t)(&dma_llp_lists[(i + 1) % link_size]);
-        dma_llp_lists[i].CTL_LO = control | DMA_CH_CTLL_LLP_EN_MASK;
-        dma_llp_lists[i].u.SIZE = area_w;
+        ctx->dma_llp_lists[i].LLP = (uint32_t)(&ctx->dma_llp_lists[(i + 1) % link_size]);
+        ctx->dma_llp_lists[i].CTL_LO = control | DMA_CH_CTLL_LLP_EN_MASK;
+        ctx->dma_llp_lists[i].u.SIZE = area_w;
     }
-    dma_llp_lists[link_size - 1].LLP = 0;
-    dma_llp_lists[link_size - 1].CTL_LO &= ~DMA_CH_CTLL_LLP_EN_MASK;
+    ctx->dma_llp_lists[link_size - 1].LLP = 0;
+    ctx->dma_llp_lists[link_size - 1].CTL_LO &= ~DMA_CH_CTLL_LLP_EN_MASK;
 
     uint32_t dst_scat = ((link_size - 1) << SG_INTERVAL_POS) | (1 << SG_COUNT_POS);
 
-    dma_channel_configure_LLP_with_size(CONFIG_LISA_DISPLAY_CPDMA_CH, dma_llp_lists, config_low, config_high, 0,
-                                        dst_scat, link_size * area_w);
+    int32_t ret = dma_channel_setup(ctx->dma_channel, DMA_CH_EN_XFER_INT, control,
+                                    config_low, config_high, 0, dst_scat);
+    if (ret != 0) {
+        LISA_LOGE(LOG_TAG, "CPDMA rotate setup failed: %d", ret);
+        return;
+    }
 
-    if (lisa_semaphore_take(g_rotate_ctx.cpdma_done_sem, 100) != 0) {
+    ret = dma_channel_start_LLP(ctx->dma_channel, ctx->dma_llp_lists);
+    if (ret != 0) {
+        LISA_LOGE(LOG_TAG, "CPDMA rotate start failed: %d", ret);
+        return;
+    }
+    if (lisa_semaphore_take(ctx->cpdma_done_sem, 100) != 0) {
         LISA_LOGE(LOG_TAG, "CPDMA rotate timeout");
     }
 }
 #endif
 
-static void panel_buf_rotate_90(const uint16_t *src_buf, uint16_t src_buf_w,
-                                    uint16_t *dst_buf, uint16_t area_w, uint16_t area_h)
+static void panel_buf_rotate_90(panel_rotate_ctx_t *ctx, const uint16_t *src_buf, uint16_t src_buf_w, uint16_t *dst_buf, uint16_t area_w, uint16_t area_h)
 {
 #if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
-    _panel_dma_rotate(src_buf, src_buf_w, dst_buf, area_w, area_h, LISA_DISPLAY_ORIENTATION_90);
+    panel_dma_rotate(ctx, src_buf, src_buf_w, dst_buf, area_w, area_h, LISA_DISPLAY_ORIENTATION_90);
 #else
+    (void)ctx;
     uint32_t invert = (area_w * area_h) - 1;
     uint32_t initial_i = ((area_w - 1) * area_h);
     for (uint16_t y = 0; y < area_h; y++) {
@@ -348,12 +467,12 @@ static void panel_buf_rotate_90(const uint16_t *src_buf, uint16_t src_buf_w,
 #endif
 }
 
-static void panel_buf_rotate_270(const uint16_t *src_buf, uint16_t src_buf_w, uint16_t *dst_buf, uint16_t area_w,
-     uint16_t area_h)
+static void panel_buf_rotate_270(panel_rotate_ctx_t *ctx, const uint16_t *src_buf, uint16_t src_buf_w, uint16_t *dst_buf, uint16_t area_w, uint16_t area_h)
 {
 #if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
-    _panel_dma_rotate(src_buf, src_buf_w, dst_buf, area_w, area_h, LISA_DISPLAY_ORIENTATION_270);
+    panel_dma_rotate(ctx, src_buf, src_buf_w, dst_buf, area_w, area_h, LISA_DISPLAY_ORIENTATION_270);
 #else
+    (void)ctx;
     for (uint16_t y = 0; y < area_h; y++) {
         for (uint16_t x = 0; x < area_w; x++) {
             uint32_t dst_idx = ((area_w - 1 - x) * area_h) + y;
@@ -364,26 +483,147 @@ static void panel_buf_rotate_270(const uint16_t *src_buf, uint16_t src_buf_w, ui
 #endif
 }
 
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+static int panel_dma_rotate_180_rows(panel_rotate_ctx_t *ctx, const uint16_t *src_buf,
+                                      uint16_t *dst_buf, uint16_t w, uint16_t h,
+                                      uint16_t row_start, uint16_t chunk_h)
+{
+    uint32_t pixels = (uint32_t)w * chunk_h;
+    const uint16_t *src = src_buf + (uint32_t)(h - row_start - chunk_h) * w;
+    uint32_t control = DMA_CH_CTLL_INT_EN | DMA_CH_CTLL_SRC_WIDTH(DMA_WIDTH_HALFWORD) |
+                       DMA_CH_CTLL_DST_WIDTH(DMA_WIDTH_HALFWORD) | DMA_CH_CTLL_SRC_INC |
+                       DMA_CH_CTLL_DST_DEC | DMA_CH_CTLL_SRC_BSIZE(DMA_BSIZE_1) |
+                       DMA_CH_CTLL_DST_BSIZE(DMA_BSIZE_1) | DMA_CH_CTLL_TTFC_M2M;
+    /* Drain a completion left by a previous failed request before reusing it. */
+    while (lisa_semaphore_take(ctx->cpdma_done_sem, 0) == 0) {
+    }
+    ctx->dma_event = 0;
+    int ret = dma_channel_configure(ctx->dma_channel, (uint32_t)src,
+                                    (uint32_t)(dst_buf + pixels - 1U), pixels, control,
+                                    DMA_CH_CFGL_CH_PRIOR(0), DMA_CH_CFGH_FIFO_MODE, 0, 0);
+    if (ret == 0 && (lisa_semaphore_take(ctx->cpdma_done_sem, 100) != 0 ||
+                     !(ctx->dma_event & DMA_EVENT_TRANSFER_COMPLETE) ||
+                     (ctx->dma_event & DMA_EVENT_ERROR))) {
+        ret = LISA_DEVICE_ERR_IO;
+    }
+    /* This channel is reserved by the panel; CPU fallback may now overwrite. */
+    dma_channel_disable(ctx->dma_channel, 1);
+    return ret;
+}
+#endif
+
+static void panel_buf_rotate_180_rows(const uint16_t *src_buf, uint16_t *dst_buf,
+                                      uint16_t area_w, uint16_t area_h,
+                                      uint16_t row_start, uint16_t chunk_h)
+{
+    for (uint16_t y = 0; y < chunk_h; y++) {
+        const uint16_t *src_row = src_buf + ((area_h - 1 - row_start - y) * area_w);
+        uint16_t *dst_row = dst_buf + ((uint32_t)y * area_w);
+
+        for (uint16_t x = 0; x < area_w; x++) {
+            dst_row[x] = src_row[area_w - 1 - x];
+        }
+    }
+}
+
+static int panel_send_data_with_sram_rotate_180(lisa_display_panel_t *panel, uint16_t w, uint16_t h, const void *bitmap)
+{
+    uint32_t rotate_buf_pixels = (uint32_t)ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH;
+    uint16_t rows_per_chunk;
+    panel_rotate_ctx_t *ctx = (panel_rotate_ctx_t *)panel->rotate_ctx;
+    const uint16_t *src_buf = (const uint16_t *)bitmap;
+    lisa_display_bus_api_t *bus_api = (lisa_display_bus_api_t *)panel->bus_dev->api;
+
+    if (!ctx) {
+        LISA_LOGE(LOG_TAG, "Rotate context not initialized");
+        return LISA_DEVICE_ERR_NOT_READY;
+    }
+
+    if (w == 0 || h == 0 || w > rotate_buf_pixels) {
+        return LISA_DEVICE_ERR_INVALID;
+    }
+
+    rows_per_chunk = rotate_buf_pixels / w;
+    if (rows_per_chunk > h) {
+        rows_per_chunk = h;
+    }
+
+    if (ctx->rotate_mutex) {
+        lisa_mutex_lock(ctx->rotate_mutex, -1);
+    }
+
+    for (uint16_t row = 0; row < h; row += rows_per_chunk) {
+        uint16_t chunk_h = h - row;
+        if (chunk_h > rows_per_chunk) {
+            chunk_h = rows_per_chunk;
+        }
+
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+        if (panel_dma_rotate_180_rows(ctx, src_buf, ctx->rotate_buf_ping, w, h, row, chunk_h) != 0)
+#endif
+        {
+            panel_buf_rotate_180_rows(src_buf, ctx->rotate_buf_ping, w, h, row, chunk_h);
+        }
+
+        int ret = bus_api->write_pixels(panel->bus_dev, ctx->rotate_buf_ping,
+                                        (size_t)w * chunk_h * sizeof(uint16_t));
+        if (ret != LISA_DEVICE_OK) {
+            LISA_LOGE(LOG_TAG, "Failed to start async transfer: %d", ret);
+            if (ctx->rotate_mutex) {
+                lisa_mutex_unlock(ctx->rotate_mutex);
+            }
+            return ret;
+        }
+
+        ret = bus_api->wait_for_completion(panel->bus_dev, 1000);
+        if (ret != LISA_DEVICE_OK) {
+            LISA_LOGE(LOG_TAG, "Async transfer timeout or error: %d", ret);
+            if (ctx->rotate_mutex) {
+                lisa_mutex_unlock(ctx->rotate_mutex);
+            }
+            return ret;
+        }
+    }
+
+    if (ctx->rotate_mutex) {
+        lisa_mutex_unlock(ctx->rotate_mutex);
+    }
+
+    return LISA_DEVICE_OK;
+}
+
 static int panel_send_data_with_sram_rotate(lisa_display_panel_t *panel, uint16_t x, uint16_t y, uint16_t w, uint16_t h, const void *bitmap)
 {
-    uint32_t data_offset = 0;
-    uint16_t *curr_buf = g_rotate_ctx.rotate_buf_ping;
-    uint16_t *next_buf = g_rotate_ctx.rotate_buf_pong;
-    const uint16_t *src_buf = (const uint16_t *)bitmap;
-
     if (h > ROTATE_BUF_MAX_HEIGHT) {
         return LISA_DEVICE_ERR_INVALID;
     }
 
+    panel_rotate_ctx_t *ctx = (panel_rotate_ctx_t *)panel->rotate_ctx;
+    if (!ctx) {
+        LISA_LOGE(LOG_TAG, "Rotate context not initialized");
+        return LISA_DEVICE_ERR_NOT_READY;
+    }
+
+    if (ctx->rotate_mutex) {
+        lisa_mutex_lock(ctx->rotate_mutex, -1);
+    }
+
+    uint32_t data_offset = 0;
+    uint16_t *curr_buf = ctx->rotate_buf_ping;
+    uint16_t *next_buf = ctx->rotate_buf_pong;
+    const uint16_t *src_buf = (const uint16_t *)bitmap;
+
     if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_90) {
         data_offset = 0;
-        panel_buf_rotate_90(src_buf + data_offset, w, curr_buf, ROTATE_BUF_WIDTH, h);
+        panel_buf_rotate_90(ctx, src_buf + data_offset, w, curr_buf, ROTATE_BUF_WIDTH, h);
     } else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_270) {
         data_offset = w - ROTATE_BUF_WIDTH;
-        panel_buf_rotate_270(src_buf + data_offset, w, curr_buf, ROTATE_BUF_WIDTH, h);
-    }
-    else {
+        panel_buf_rotate_270(ctx, src_buf + data_offset, w, curr_buf, ROTATE_BUF_WIDTH, h);
+    } else {
         LISA_LOGE(LOG_TAG, "Invalid orientation");
+        if (ctx->rotate_mutex) {
+            lisa_mutex_unlock(ctx->rotate_mutex);
+        }
         return LISA_DEVICE_ERR_INVALID;
     }
 
@@ -392,26 +632,31 @@ static int panel_send_data_with_sram_rotate(lisa_display_panel_t *panel, uint16_
     for (uint16_t i = 0; i < w; i += ROTATE_BUF_WIDTH) {
         size_t chunk_size = (size_t)ROTATE_BUF_WIDTH * h * sizeof(uint16_t);
 
-        // 使用异步传输，实现 CPU/DMA 并行操作
-        int ret = bus_api->write_pixels(panel->bus_dev,curr_buf, chunk_size);
+        int ret = bus_api->write_pixels(panel->bus_dev, curr_buf, chunk_size);
         if (ret != LISA_DEVICE_OK) {
             LISA_LOGE(LOG_TAG, "Failed to start async transfer: %d", ret);
+            if (ctx->rotate_mutex) {
+                lisa_mutex_unlock(ctx->rotate_mutex);
+            }
             return ret;
         }
 
-        // 在 DMA 传输的同时，准备下一块数据
-        if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_90) {
-            data_offset += ROTATE_BUF_WIDTH;
-            panel_buf_rotate_90(src_buf + data_offset, w, next_buf, ROTATE_BUF_WIDTH, h);
-        } else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_270) {
-            data_offset -= ROTATE_BUF_WIDTH;
-            panel_buf_rotate_270(src_buf + data_offset, w, next_buf, ROTATE_BUF_WIDTH, h);
+        if ((i + ROTATE_BUF_WIDTH) < w) {
+            if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_90) {
+                data_offset += ROTATE_BUF_WIDTH;
+                panel_buf_rotate_90(ctx, src_buf + data_offset, w, next_buf, ROTATE_BUF_WIDTH, h);
+            } else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_270) {
+                data_offset -= ROTATE_BUF_WIDTH;
+                panel_buf_rotate_270(ctx, src_buf + data_offset, w, next_buf, ROTATE_BUF_WIDTH, h);
+            }
         }
 
-        // 等待当前 DMA 传输完成
         ret = bus_api->wait_for_completion(panel->bus_dev, 1000);
         if (ret != LISA_DEVICE_OK) {
             LISA_LOGE(LOG_TAG, "Async transfer timeout or error: %d", ret);
+            if (ctx->rotate_mutex) {
+                lisa_mutex_unlock(ctx->rotate_mutex);
+            }
             return ret;
         }
 
@@ -419,4 +664,10 @@ static int panel_send_data_with_sram_rotate(lisa_display_panel_t *panel, uint16_
         curr_buf = next_buf;
         next_buf = temp;
     }
+
+    if (ctx->rotate_mutex) {
+        lisa_mutex_unlock(ctx->rotate_mutex);
+    }
+
+    return LISA_DEVICE_OK;
 }

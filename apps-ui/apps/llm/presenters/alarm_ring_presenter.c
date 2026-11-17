@@ -15,6 +15,9 @@
 #include "lisa_ui.h"
 #include "lisa_ui_nav_scr.h"
 #include "lisa_ui_nav_scr_ids.h"
+#ifdef CONFIG_MINIAPP
+#include "miniapp.h"
+#endif
 #include "alarm_ring_view.h"
 #include "model_alarm.h"
 #include "model_voice.h"
@@ -115,7 +118,11 @@ static void alarm_ring_nav_home_ui(void *arg, uint32_t len)
 
     LISA_UI_LOGI("Alarm ring: nav_home_ui invoked, top_id=%d", lisa_ui_nav_scr_get_top_id());
     if (lisa_ui_nav_scr_get_top_id() == LISA_UI_NAV_SCR_ID_ALARM_RING) {
-        lisa_ui_nav_scr_nav_to(LISA_UI_NAV_SCR_ID_HOME);
+        lisa_ui_nav_scr_nav_to(
+#ifdef CONFIG_MINIAPP
+            miniapp_is_active() ? LISA_UI_NAV_SCR_ID_MINIAPP :
+#endif
+            LISA_UI_NAV_SCR_ID_HOME);
     }
 }
 
@@ -131,27 +138,15 @@ static void alarm_ring_on_wakeup(void *unused, uint32_t msg_id, void *data, uint
     lisa_ui_invoke_ui_delayed(alarm_ring_nav_home_ui, NULL, 0, 0);
 }
 
-static void alarm_ring_on_button_change(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
+static void alarm_ring_on_alarm_stopped(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
 {
     (void)unused;
     (void)msg_id;
+    (void)data;
+    (void)len;
     (void)user_data;
 
-    if (!data || len < sizeof(voice_msg_button_evt_t)) {
-        return;
-    }
-
-    const voice_msg_button_evt_t *evt = (const voice_msg_button_evt_t *)data;
-    if (evt->button_id != 0) {
-        return;
-    }
-
-    if (evt->action != VOICE_MSG_BUTTON_ACTION_CLICK &&
-        evt->action != VOICE_MSG_BUTTON_ACTION_LONG_HOLD) {
-        return;
-    }
-
-    LISA_UI_LOGI("Alarm ring: button action=%d, navigating to home", evt->action);
+    LISA_UI_LOGI("Alarm ring: alarm stopped, navigating to home");
     lisa_ui_invoke_ui_delayed(alarm_ring_nav_home_ui, NULL, 0, 0);
 }
 
@@ -307,15 +302,31 @@ static void stop_btn_event_cb(lv_event_t *e)
     
     if (code == LV_EVENT_CLICKED) {
         LISA_UI_LOGI("Alarm ring: stop button clicked, navigating to home");
-        lisa_ui_nav_scr_nav_to(LISA_UI_NAV_SCR_ID_HOME);
+        lisa_ui_nav_scr_nav_to(
+#ifdef CONFIG_MINIAPP
+            miniapp_is_active() ? LISA_UI_NAV_SCR_ID_MINIAPP :
+#endif
+            LISA_UI_NAV_SCR_ID_HOME);
     }
 }
 
 static void alarm_ring_auto_return_cb(lv_timer_t *timer)
 {
-    (void)timer;
+    struct alarm_ring_nav_scr_data *scr_data = NULL;
+
+    if (timer) {
+        scr_data = (struct alarm_ring_nav_scr_data *)timer->user_data;
+        if (scr_data) {
+            scr_data->auto_return = NULL;
+        }
+    }
+
     LISA_UI_LOGI("Alarm ring: auto return timer, navigating to home");
-    lisa_ui_nav_scr_nav_to(LISA_UI_NAV_SCR_ID_HOME);
+    lisa_ui_nav_scr_nav_to(
+#ifdef CONFIG_MINIAPP
+            miniapp_is_active() ? LISA_UI_NAV_SCR_ID_MINIAPP :
+#endif
+            LISA_UI_NAV_SCR_ID_HOME);
 }
 
 static int alarm_ring_nav_scr_open(const struct lisa_ui_nav_scr *scr, void **data)
@@ -342,7 +353,8 @@ static int alarm_ring_nav_scr_open(const struct lisa_ui_nav_scr *scr, void **dat
 
     alarm_ring_view_set_stop_cb(scr_data->view, stop_btn_event_cb, NULL);
 
-    scr_data->auto_return = lv_timer_create(alarm_ring_auto_return_cb, ALARM_RING_AUTO_RETURN_MS, NULL);
+    scr_data->auto_return =
+        lv_timer_create(alarm_ring_auto_return_cb, ALARM_RING_AUTO_RETURN_MS, scr_data);
     if (!scr_data->auto_return) {
         LISA_UI_LOGE("Failed to create auto return timer");
         lv_obj_del(scr_data->view);
@@ -355,9 +367,8 @@ static int alarm_ring_nav_scr_open(const struct lisa_ui_nav_scr *scr, void **dat
     voice_msg_sub(VOICE_MSG_ALARM_TRIGGER, alarm_ring_on_alarm_trigger, scr_data);
     voice_msg_sub(VOICE_MSG_ALARM_CREATE, alarm_ring_on_alarm_create, scr_data);
     voice_msg_sub(VOICE_MSG_ALARM_RING_UPDATE, alarm_ring_on_ui_update, scr_data);
+    voice_msg_sub(VOICE_MSG_ALARM_STOPPED, alarm_ring_on_alarm_stopped, scr_data);
     voice_msg_sub(VOICE_MSG_WAKEUP_KEYWORD, alarm_ring_on_wakeup, scr_data);
-    voice_msg_sub(VOICE_MSG_WAKEUP_COMMAND, alarm_ring_on_wakeup, scr_data);
-    voice_msg_sub(VOICE_MSG_BUTTON_CHANGE, alarm_ring_on_button_change, scr_data);
     voice_msg_sub(VOICE_MSG_CLOUD_IAT_START, alarm_ring_on_iat, scr_data);
     voice_msg_sub(VOICE_MSG_CLOUD_IAT_UPDATE, alarm_ring_on_iat, scr_data);
     voice_msg_sub(VOICE_MSG_CLOUD_IAT_END, alarm_ring_on_iat, scr_data);
@@ -413,14 +424,13 @@ static int alarm_ring_nav_scr_close(const struct lisa_ui_nav_scr *scr, void *dat
     if (scr_data) {
 #ifdef LISA_UI_PLATFORM_ARCS
         voice_msg_unsub(VOICE_MSG_WAKEUP_KEYWORD, alarm_ring_on_wakeup);
-        voice_msg_unsub(VOICE_MSG_WAKEUP_COMMAND, alarm_ring_on_wakeup);
-        voice_msg_unsub(VOICE_MSG_BUTTON_CHANGE, alarm_ring_on_button_change);
         voice_msg_unsub(VOICE_MSG_CLOUD_IAT_START, alarm_ring_on_iat);
         voice_msg_unsub(VOICE_MSG_CLOUD_IAT_UPDATE, alarm_ring_on_iat);
         voice_msg_unsub(VOICE_MSG_CLOUD_IAT_END, alarm_ring_on_iat);
         voice_msg_unsub(VOICE_MSG_ALARM_TRIGGER, alarm_ring_on_alarm_trigger);
         voice_msg_unsub(VOICE_MSG_ALARM_CREATE, alarm_ring_on_alarm_create);
         voice_msg_unsub(VOICE_MSG_ALARM_RING_UPDATE, alarm_ring_on_ui_update);
+        voice_msg_unsub(VOICE_MSG_ALARM_STOPPED, alarm_ring_on_alarm_stopped);
 #endif
 
         if (scr_data->auto_return) {

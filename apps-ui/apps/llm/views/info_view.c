@@ -10,6 +10,7 @@
 
 #include "info_view.h"
 #include "lisa_ui.h"
+#include "lisa_ui_assets.h"
 #include "lisa_ui_llm_base.h"
 #include "lisa_ui_res.h"
 #include "lisa_ui_fonts.h"
@@ -17,7 +18,7 @@
 
 
 /** Default text displayed when no specific info is set */
-#define DEFAULT_INFO_TEXT "Please scan QR code"
+#define DEFAULT_INFO_TEXT "请使用微信扫码"
 
 /**
  * @brief Info view structure
@@ -29,6 +30,9 @@ struct lisa_ui_info_view {
     /* Content elements */
     lv_obj_t *top_label;               /**< Top instruction text */
     lv_obj_t *qr_img;                  /**< QR code image */
+#ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
+    lv_obj_t *qr_img_secondary;        /**< Secondary image for right display */
+#endif
     lv_obj_t *bottom_label;            /**< Bottom information text */
     
     /* QR image descriptor for RGB565 data */
@@ -36,6 +40,25 @@ struct lisa_ui_info_view {
 };
 
 typedef struct lisa_ui_info_view lisa_ui_info_view_t;
+
+static void info_view_align_content(lisa_ui_info_view_t *view)
+{
+    if (lv_obj_has_flag(view->qr_img, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_align(view->top_label, LV_ALIGN_CENTER, 0, -28);
+        lv_obj_align(view->bottom_label, LV_ALIGN_CENTER, 0, 20);
+        return;
+    }
+
+#if defined(CONFIG_BOARD_ARCS_MINI) && !defined(CONFIG_BOARD_ARCS_MINI_DOLL_V2)
+    /* 在 240 像素屏幕上为两行标题、148 像素二维码和页脚分别留位。 */
+    lv_obj_align(view->top_label, LV_ALIGN_CENTER, 0, -92);
+    lv_obj_align(view->qr_img, LV_ALIGN_CENTER, 0, 4);
+    lv_obj_align(view->bottom_label, LV_ALIGN_BOTTOM_MID, 0, -12);
+#else
+    lv_obj_align_to(view->top_label, view->qr_img, LV_ALIGN_OUT_TOP_MID, 0, -25);
+    lv_obj_align_to(view->bottom_label, view->qr_img, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+#endif
+}
 
 static void lisa_ui_info_view_class_constructor(const lv_obj_class_t *class_p, lv_obj_t *obj);
 static void lisa_ui_info_view_class_destructor(const lv_obj_class_t *class_p, lv_obj_t *obj);
@@ -46,6 +69,43 @@ const lv_obj_class_t lisa_ui_info_view_class = {
     .constructor_cb = lisa_ui_info_view_class_constructor,
     .destructor_cb = lisa_ui_info_view_class_destructor,
 };
+
+#ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
+static void info_view_align_labels(lisa_ui_info_view_t *info_view)
+{
+    if (!info_view) {
+        return;
+    }
+
+    info_view_align_content(info_view);
+}
+
+static void info_view_set_doll_v2_netcfg_layout(lisa_ui_info_view_t *info_view)
+{
+    lv_obj_set_size(info_view->qr_img, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(info_view->qr_img, LV_ALIGN_CENTER, 0, 0);
+
+    if (info_view->qr_img_secondary) {
+        lv_obj_add_flag(info_view->qr_img_secondary, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    info_view_align_labels(info_view);
+}
+
+static void info_view_set_default_doll_v2_layout(lisa_ui_info_view_t *info_view)
+{
+    lv_obj_set_size(info_view->qr_img, 160, 160);
+    lv_obj_align(info_view->qr_img, LV_ALIGN_CENTER, -80, 0);
+
+    if (info_view->qr_img_secondary) {
+        lv_obj_set_size(info_view->qr_img_secondary, 160, 160);
+        lv_obj_align(info_view->qr_img_secondary, LV_ALIGN_CENTER, 80, 0);
+        lv_obj_add_flag(info_view->qr_img_secondary, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    info_view_align_labels(info_view);
+}
+#endif
 
 static void lisa_ui_info_view_class_constructor(const lv_obj_class_t *class_p, lv_obj_t *obj)
 {
@@ -69,6 +129,11 @@ static void lisa_ui_info_view_class_constructor(const lv_obj_class_t *class_p, l
 #ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
     lv_obj_set_size(info_view->qr_img, 160, 160);
     lv_obj_align(info_view->qr_img, LV_ALIGN_CENTER, -80, 0);
+
+    info_view->qr_img_secondary = lv_img_create(container);
+    lv_obj_set_size(info_view->qr_img_secondary, 160, 160);
+    lv_obj_align(info_view->qr_img_secondary, LV_ALIGN_CENTER, 80, 0);
+    lv_obj_add_flag(info_view->qr_img_secondary, LV_OBJ_FLAG_HIDDEN);
 #else
     lv_obj_set_size(info_view->qr_img, 148, 148);
     lv_obj_align(info_view->qr_img, LV_ALIGN_CENTER, 0, 5);
@@ -93,6 +158,8 @@ static void lisa_ui_info_view_class_constructor(const lv_obj_class_t *class_p, l
     lv_obj_set_width(info_view->bottom_label, LV_PCT(90));
     lv_label_set_long_mode(info_view->bottom_label, LV_LABEL_LONG_WRAP);
     lv_obj_align_to(info_view->bottom_label, info_view->qr_img, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+    lv_obj_set_style_text_opa(info_view->bottom_label, LV_OPA_70, LV_PART_MAIN);
+    info_view_align_content(info_view);
 }
 
 static void lisa_ui_info_view_class_destructor(const lv_obj_class_t *class_p, lv_obj_t *obj)
@@ -124,6 +191,7 @@ void lisa_ui_info_view_set_top_text(lv_obj_t *obj, const char *text)
     lisa_ui_info_view_t *info_view = (lisa_ui_info_view_t *)obj;
     if (info_view->top_label) {
         lv_label_set_text(info_view->top_label, text ? text : DEFAULT_INFO_TEXT);
+        info_view_align_content(info_view);
     }
 }
 
@@ -136,6 +204,7 @@ void lisa_ui_info_view_set_bottom_text(lv_obj_t *obj, const char *text)
     lisa_ui_info_view_t *info_view = (lisa_ui_info_view_t *)obj;
     if (info_view->bottom_label) {
         lv_label_set_text(info_view->bottom_label, text ? text : "");
+        info_view_align_content(info_view);
     }
 }
 
@@ -146,9 +215,25 @@ void lisa_ui_info_view_set_qr_image(lv_obj_t *obj, const void *src)
     }
     
     lisa_ui_info_view_t *info_view = (lisa_ui_info_view_t *)obj;
-    if (info_view->qr_img && src) {
-        lv_img_set_src(info_view->qr_img, src);
+    if (!src) {
+        lv_obj_add_flag(info_view->qr_img, LV_OBJ_FLAG_HIDDEN);
+#ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
+        lv_obj_add_flag(info_view->qr_img_secondary, LV_OBJ_FLAG_HIDDEN);
+#endif
+        info_view_align_content(info_view);
+        return;
     }
+    lv_img_set_src(info_view->qr_img, src);
+    lv_obj_clear_flag(info_view->qr_img, LV_OBJ_FLAG_HIDDEN);
+
+#ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
+    if (src == &png_ble_netcfg_bind_doll_v2_png) {
+        info_view_set_doll_v2_netcfg_layout(info_view);
+    } else {
+        info_view_set_default_doll_v2_layout(info_view);
+    }
+#endif
+    info_view_align_content(info_view);
 }
 
 lv_obj_t *lisa_ui_info_view_get_qr_image(lv_obj_t *obj)
@@ -182,5 +267,5 @@ void lisa_ui_info_view_set_qr_rgb565(lv_obj_t *obj, const uint16_t *data, uint16
     info_view->qr_img_desc.data = (const uint8_t *)data;
     
     // Set image source to descriptor
-    lv_img_set_src(info_view->qr_img, &info_view->qr_img_desc);
+    lisa_ui_info_view_set_qr_image(obj, &info_view->qr_img_desc);
 }

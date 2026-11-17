@@ -57,6 +57,7 @@ extern "C" {
 typedef struct callback_event {
     app_player_event_t event;       /**< 事件类型 */
     struct callback_event *next;    /**< 链表指针 */
+    uint32_t request_tag;
 } callback_event_t;
 
 /**
@@ -97,9 +98,11 @@ struct app_player_s {
     PlayerEvt last_evt;             /**< 最后一次事件 */
 
     bool is_preparing;              /**< 准备中标志 */
+    bool stop_preparing_requested;  /**< preparing 阶段收到 stop，请求抑制自动播放 */
     bool wait_prepare_intercepted;  /**< 等待准备中断标志 */
     bool pause_preparing;           /**< 准备时暂停标志 */
     bool prepare_error;             /**< 准备过程中发生错误标志 */
+    bool drain_in_progress;         /**< 排空残留 PREPARED 状态中，抑制上层回调 */
     lisa_semaphore_t *preparing_sem; /**< 准备同步信号量 */
     lisa_semaphore_t *pause_sem;    /**< 暂停同步信号量 */
 
@@ -124,6 +127,11 @@ struct app_player_s {
     char *pending_url;              /**< 待播放URL（焦点被抢占时保存） */
     uint32_t pending_throw_time;    /**< 待播放的throw_time参数 */
 #endif
+    const volatile uint32_t *play_cancel_token;
+    uint32_t play_request_tag;
+    uint32_t callback_request_tag;
+    SemaphoreHandle_t cancel_lock;
+    bool cancel_requested;
 };
 
 /**
@@ -132,6 +140,9 @@ struct app_player_s {
  * @param event 事件类型
  */
 void __enqueue_callback_event(app_player_t *player, app_player_event_t event);
+
+bool __app_player_play_cancelled(const app_player_t *player);
+bool __app_player_play_cancelled_locked(const app_player_t *player);
 
 /**
  * @brief 通过播放器ID查找播放器实例（内部函数，由 core 层调用）
@@ -146,6 +157,10 @@ app_player_t *__find_player_by_id(uint32_t id);
  * @return 播放器实例指针，未找到返回 NULL
  */
 app_player_t *__find_player_by_focus_channel_id(int focus_channel_id);
+
+/** Acquire/release this player's PA reference around actual audio output. */
+int __app_player_pa_acquire(app_player_t *player);
+void __app_player_pa_release(app_player_t *player, uint32_t delay_ms);
 
 #ifdef __cplusplus
 }

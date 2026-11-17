@@ -12,6 +12,7 @@
 #include "app_player_internal.h"
 #include "app_player_core.h"
 #include "pa_manager.h"
+#include "lisa_player_adapter.h"
 
 #ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
 #include "app_player_focus.h"
@@ -213,6 +214,9 @@ int app_player_init(const app_player_config_t *config)
 
     LISA_LOGI(TAG, "Initializing app_player module");
 
+    // 设置 PCM 输出回调（如果提供）
+    app_player_adapter_set_pcm_output(config->pcm_output_callback);
+
     // 初始化 PA 管理器
     pa_manager_config_t pa_config = {
         .ctrl_callback = config->pa_ctrl_callback
@@ -312,6 +316,7 @@ void __enqueue_callback_event(app_player_t *player, app_player_event_t event)
     }
 
     evt->event = event;
+    evt->request_tag = player->play_request_tag;
     evt->next = NULL;
 
     // 加入队列
@@ -376,6 +381,7 @@ static void __callback_thread_func(void *arg)
 
             // 调用用户回调（不持锁）
             if (cb) {
+                player->callback_request_tag = evt->request_tag;
                 cb(player, evt->event, user_data);
             }
 
@@ -407,6 +413,41 @@ static void __callback_thread_func(void *arg)
  * - PAUSED/STOPPED/COMPLETE/ERROR事件：关PA（引用计数-1）
  * - 配合PA管理器的引用计数，避免多实例互相干扰
  */
+int __app_player_pa_acquire(app_player_t *player)
+{
+    if (!player || player->pa_is_on) {
+        return 0;
+    }
+
+    int ret = pa_manager_control(1, 0);
+    if (ret != 0) {
+        LISA_LOGE(TAG, "Player[%d] %s: PA ON failed: %d",
+                  player->id, player->name, ret);
+        return ret;
+    }
+
+    player->pa_is_on = true;
+    LISA_LOGI(TAG, "Player[%d] %s: PA acquired before audio output",
+              player->id, player->name);
+    return 0;
+}
+
+void __app_player_pa_release(app_player_t *player, uint32_t delay_ms)
+{
+    if (!player || !player->pa_is_on) {
+        return;
+    }
+
+    int ret = pa_manager_control(0, delay_ms);
+    /* The manager consumes the reference before applying the hardware state. */
+    player->pa_is_on = false;
+    if (ret != 0) {
+        LISA_LOGE(TAG, "Player[%d] %s: PA OFF failed: %d",
+                  player->id, player->name, ret);
+        return;
+    }
+}
+
 static void __app_player_upper_callback_handler(app_player_t *player, PlayerEvt evt, bool should_notify_user)
 {
     if (!player) {
@@ -422,8 +463,7 @@ static void __app_player_upper_callback_handler(app_player_t *player, PlayerEvt 
             // 真正开始播放时才开启PA
             if (!player->pa_is_on) {
                 LISA_LOGI(TAG, "Player[%d] %s: PLAYING -> PA ON", player->id, player->name);
-                pa_manager_control(1, 0);
-                player->pa_is_on = true;
+                __app_player_pa_acquire(player);
             } else {
                 LISA_LOGI(TAG, "Player[%d] %s: PLAYING but PA already on, skip", player->id, player->name);
             }
@@ -443,8 +483,7 @@ static void __app_player_upper_callback_handler(app_player_t *player, PlayerEvt 
                 } else {
                     LISA_LOGI(TAG, "Player[%d] %s: evt=%d -> PA OFF (delayed %dms)",
                               player->id, player->name, evt, CONFIG_APP_PLAYER_PA_OFF_DELAY_MS);
-                    pa_manager_control(0, CONFIG_APP_PLAYER_PA_OFF_DELAY_MS);
-                    player->pa_is_on = false;
+                    __app_player_pa_release(player, CONFIG_APP_PLAYER_PA_OFF_DELAY_MS);
                 }
             } else {
                 LISA_LOGI(TAG, "Player[%d] %s: evt=%d but PA not on, skip PA off",
@@ -577,7 +616,17 @@ app_player_t *app_player_create(const char *name)
     // 初始化状态
     player->state = APP_PLAYER_STATE_IDLE;
     player->last_evt = PLAYER_EVT_INIT;
+    player->play_cancel_token = NULL;
+    player->play_request_tag = 0U;
+    player->callback_request_tag = 0U;
+    player->cancel_lock = PLAYER_MUTEX_CREATE();
+    if (!player->cancel_lock) {
+        LISA_LOGE(TAG, "Create failed: cancel_lock create failed");
+        goto _err;
+    }
+    player->cancel_requested = false;
     player->is_preparing = false;
+    player->stop_preparing_requested = false;
     player->wait_prepare_intercepted = false;
     player->pause_preparing = false;
     player->is_stream_mode = false;
@@ -717,6 +766,10 @@ _err:
         PLAYER_MUTEX_DELETE(player->core_lock);
     }
 
+    if (player->cancel_lock) {
+        PLAYER_MUTEX_DELETE(player->cancel_lock);
+    }
+
     if (player->name) {
         lisa_mem_free(player->name);
     }
@@ -771,6 +824,52 @@ int app_player_register_callback(app_player_t *player, app_player_event_cb_t eve
  * @return  APP_PLAYER_OK 成功，其他表示错误
  * @note    支持URL播放和流式播放模式
  */
+static bool __app_player_play_opt_cancelled(const app_player_play_opt_t *opt)
+{
+    return opt != NULL &&
+           opt->cancel_token != NULL &&
+           *opt->cancel_token != opt->request_tag;
+}
+
+bool __app_player_play_cancelled_locked(const app_player_t *player)
+{
+    return player != NULL &&
+           (player->cancel_requested ||
+            (player->play_cancel_token != NULL &&
+             *player->play_cancel_token != player->play_request_tag));
+}
+
+bool __app_player_play_cancelled(const app_player_t *player)
+{
+    bool cancelled;
+
+    if (player == NULL) {
+        return false;
+    }
+
+    PLAYER_MUTEX_LOCK(player->cancel_lock, LISA_OS_WAIT_FOREVER);
+    cancelled = __app_player_play_cancelled_locked(player);
+    PLAYER_MUTEX_UNLOCK(player->cancel_lock);
+    return cancelled;
+}
+
+uint32_t app_player_get_callback_request_tag(app_player_t *player)
+{
+    return player != NULL ? player->callback_request_tag : 0U;
+}
+
+int app_player_cancel_pending(app_player_t *player)
+{
+    if (player == NULL) {
+        return APP_PLAYER_ERR_INVALID_PARAM;
+    }
+
+    PLAYER_MUTEX_LOCK(player->cancel_lock, LISA_OS_WAIT_FOREVER);
+    player->cancel_requested = true;
+    PLAYER_MUTEX_UNLOCK(player->cancel_lock);
+    return APP_PLAYER_OK;
+}
+
 int app_player_play_ex(app_player_t *player, const app_player_play_opt_t *opt)
 {
     if (!player) {
@@ -793,13 +892,32 @@ int app_player_play_ex(app_player_t *player, const app_player_play_opt_t *opt)
         return APP_PLAYER_ERR_INVALID_PARAM;
     }
 
+    if (__app_player_play_opt_cancelled(opt)) {
+        LISA_LOGI(TAG, "Play cancelled at entry: %s tag=%u",
+                  player->name, opt->request_tag);
+        return APP_PLAYER_ERR_INVALID_STATE;
+    }
+
     PLAYER_MUTEX_LOCK(player->operation_lock, LISA_OS_WAIT_FOREVER);
+    PLAYER_MUTEX_LOCK(player->cancel_lock, LISA_OS_WAIT_FOREVER);
+    player->play_cancel_token = opt->cancel_token;
+    player->play_request_tag = opt->request_tag;
+    player->cancel_requested = false;
+    bool cancelled = __app_player_play_cancelled_locked(player);
+    PLAYER_MUTEX_UNLOCK(player->cancel_lock);
+    if (cancelled) {
+        LISA_LOGI(TAG, "Play cancelled before start: %s tag=%u",
+                  player->name, opt->request_tag);
+        PLAYER_MUTEX_UNLOCK(player->operation_lock);
+        return APP_PLAYER_ERR_INVALID_STATE;
+    }
+    /* 新一次播放开始，清除 preparing-stop 请求标志 */
+    player->stop_preparing_requested = false;
 
 #ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
     // 检查当前播放状态，如果已经在播放/准备中，先停止
     PlayerState lisa_state = lisa_player_get_state(player->hld);
-    if (lisa_state == PLAYER_ST_PLAYING || lisa_state == PLAYER_ST_PREPARED ||
-        lisa_state == PLAYER_ST_READY_TO_PLAY || lisa_state == PLAYER_ST_PAUSED) {
+    if (lisa_state == PLAYER_ST_PLAYING || lisa_state == PLAYER_ST_PAUSED) {
         LISA_LOGI(TAG, "Player %s already active (state=%d), stopping before new play",
                   player->name, lisa_state);
 
@@ -809,6 +927,39 @@ int app_player_play_ex(app_player_t *player, const app_player_play_opt_t *opt)
             LISA_LOGW(TAG, "Player %s stop before replay failed: %d, continuing anyway",
                       player->name, stop_ret);
         }
+    } else if (lisa_state == PLAYER_ST_PREPARED) {
+        /* PREPARED 状态：lisa_player_reset 从 PREPARED 不会真正让状态机回到 IDLE
+         * （pre_close+reset 也不行），后续 core_play 的 reset 会卡死。
+         *
+         * 唯一可靠的排空路径是 play → stop_sync：PREPARED → PLAYING（lisa_player_play
+         * 支持，老的非 stop_preparing 分支就是这么用的）；PLAYING → STOPPED
+         * （stop_sync 从 PLAYING 工作正常）。
+         *
+         * 期间用 drain_in_progress 标志压制上层回调，避免：
+         *   - PA 闪一下（app_player_upper_callback_handler 在 PLAYING 事件里开 PA）
+         *   - 焦点抖动（PLAYING/STOPPED 事件会触发焦点策略）
+         *   - 虚假的 PLAYER_EVT_PLAYING / STOPED 被 voice_player 当成真实 TTS 事件 */
+        LISA_LOGI(TAG, "Player %s in PREPARED state (%d), drain via play+stop_sync",
+                  player->name, lisa_state);
+        player->drain_in_progress = true;
+        if (lisa_player_play(player->hld) == PLAYER_OK) {
+            PlayerErr stop_ret = lisa_player_stop_sync(player->hld);
+            if (stop_ret != PLAYER_OK) {
+                LISA_LOGW(TAG, "Drain stop_sync failed: %d", stop_ret);
+            }
+        } else {
+            LISA_LOGW(TAG, "Drain play failed for %s", player->name);
+        }
+        player->drain_in_progress = false;
+        player->is_preparing = false;
+    } else if (lisa_state == PLAYER_ST_READY_TO_PLAY) {
+        /* READY_TO_PLAY（准备中）状态下不动 player：__app_player_try_interrupt_prepare_stop
+         * 这条路径专门处理 stop 期间 preparing，让 prepare 完成回调把状态收尾。
+         * 这里跳过 stop_sync，避免 core_stop_sync 兜底入队虚假 STOPPED 事件被
+         * voice_cloud_msg 当作"上一段 TTS 播完"误触发 continuous session restart。 */
+        LISA_LOGI(TAG, "Player %s in preparing state (%d), skip stop_sync before new play",
+                  player->name, lisa_state);
+        player->is_preparing = false;
     }
 
     // 清除焦点暂停标志（用户主动播放）
@@ -839,6 +990,16 @@ int app_player_play_ex(app_player_t *player, const app_player_play_opt_t *opt)
 #endif
 
     // 调用 core 层播放（PA控制由PLAYING事件回调处理）
+    if (__app_player_play_cancelled(player)) {
+        LISA_LOGI(TAG, "Play cancelled before core start: %s tag=%u",
+                  player->name, opt->request_tag);
+#ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
+        app_player_focus_release(player, true);
+#endif
+        PLAYER_MUTEX_UNLOCK(player->operation_lock);
+        return APP_PLAYER_ERR_INVALID_STATE;
+    }
+
     int ret = app_player_core_play(player, opt->url, opt->throw_time_ms);
     if (ret != 0) {
         LISA_LOGE(TAG, "Play failed: app_player_core_play error %d", ret);
@@ -887,6 +1048,60 @@ int app_player_play(app_player_t *player, const char *url)
     return app_player_play_ex(player, &opt);
 }
 
+static int __app_player_try_interrupt_prepare_stop(app_player_t *player)
+{
+    PlayerState state;
+    bool prepare_active;
+    PlayerErr pre_close_ret;
+    PlayerErr reset_ret;
+
+    if (!player) {
+        return -1;
+    }
+
+    state = lisa_player_get_state(player->hld);
+    prepare_active = player->is_preparing || (state == PLAYER_ST_READY_TO_PLAY);
+    if (!prepare_active) {
+        return 1;
+    }
+
+    LISA_LOGI(TAG, "Stop %s while preparing, interrupt prepare first (state=%d)",
+              player->name, state);
+
+#ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
+    // 标记为用户主动stop，后续焦点释放时跳过策略执行
+    app_player_focus_set_user_initiated(player, true);
+#endif
+
+    /* preparing 快速中断路径：不等待 prepare 完成 */
+    player->prepare_error = true;
+    player->pause_preparing = false;
+    player->wait_prepare_intercepted = true;
+
+    pre_close_ret = lisa_player_pre_close(player->hld);
+    if (pre_close_ret < 0) {
+        LISA_LOGW(TAG, "Interrupt prepare stop pre_close failed for %s: %d",
+                  player->name, pre_close_ret);
+    }
+
+    reset_ret = lisa_player_reset(player->hld);
+    if (reset_ret != PLAYER_OK) {
+        LISA_LOGW(TAG, "Interrupt prepare stop reset failed for %s: %d",
+                  player->name, reset_ret);
+    }
+
+    player->is_preparing = false;
+    player->wait_prepare_intercepted = false;
+    lisa_semaphore_give(player->preparing_sem);
+
+#ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
+    // prepare 被中断后，主动释放焦点
+    app_player_focus_release(player, true);
+#endif
+
+    return 0;
+}
+
 /**
  * @brief   停止播放（同步）
  * @param   player 播放器实例
@@ -907,7 +1122,15 @@ int app_player_stop(app_player_t *player)
     }
 
     LISA_LOGI(TAG, "Stop: %s", player->name);
-
+    (void)app_player_cancel_pending(player);
+    /* stop 优先，抑制 preparing 完成后的自动播放 */
+    player->stop_preparing_requested = true;
+    
+    // 优先处理中断prepare场景，避免被 operation_lock 长时间阻塞导致 stop 失效
+    if (__app_player_try_interrupt_prepare_stop(player) == 0) {
+        return APP_PLAYER_OK;
+    }
+    
     PLAYER_MUTEX_LOCK(player->operation_lock, LISA_OS_WAIT_FOREVER);
 
 #ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
@@ -1083,6 +1306,7 @@ int app_player_reset(app_player_t *player)
 
     // 清除准备中标志
     player->is_preparing = false;
+    player->stop_preparing_requested = false;
     player->wait_prepare_intercepted = false;
     player->pause_preparing = false;
 
@@ -1111,6 +1335,43 @@ int app_player_reset(app_player_t *player)
     app_player_focus_release(player, true);
 #endif
 
+    return APP_PLAYER_OK;
+}
+
+int app_player_set_decode_prepared_count(app_player_t *player, uint32_t count)
+{
+    if (!player || count == 0) {
+        LISA_LOGE(TAG, "Set prepared count failed: invalid param");
+        return APP_PLAYER_ERR_INVALID_PARAM;
+    }
+
+    PlayerErr ret = lisa_player_set_decode_prepared_count(player->hld, count);
+    if (ret != PLAYER_OK) {
+        LISA_LOGE(TAG, "Set prepared count failed: %d", ret);
+        return APP_PLAYER_ERR_INVALID_PARAM;
+    }
+
+    LISA_LOGI(TAG, "Set prepared count: %s, count=%u", player->name, count);
+    return APP_PLAYER_OK;
+}
+
+int app_player_set_readstream_buf_size(app_player_t *player, uint32_t size)
+{
+    if (!player) {
+        LISA_LOGE(TAG, "Set readstream buf size failed: invalid param");
+        return APP_PLAYER_ERR_INVALID_PARAM;
+    }
+
+    PlayerErr ret = lisa_player_set_readstream_buf_size(player->hld, size);
+    if (ret != PLAYER_OK) {
+        LISA_LOGE(TAG, "Set readstream buf size failed: %d", ret);
+        if (ret == PLAYER_INVALID_STATE) {
+            return APP_PLAYER_ERR_INVALID_STATE;
+        }
+        return APP_PLAYER_ERR_INVALID_PARAM;
+    }
+
+    LISA_LOGI(TAG, "Set readstream buf size: %s, size=%u", player->name, size);
     return APP_PLAYER_OK;
 }
 
@@ -1365,6 +1626,16 @@ int app_player_play_stream(app_player_t *player, uint32_t sample_rate, uint8_t c
 
     PLAYER_MUTEX_LOCK(player->operation_lock, LISA_OS_WAIT_FOREVER);
 
+    /* A stream is a new playback request, just like play_ex. Stop/reset may
+     * leave cancellation from the previous request latched; do not let its
+     * token suppress this stream's PREPARED callback. */
+    PLAYER_MUTEX_LOCK(player->cancel_lock, LISA_OS_WAIT_FOREVER);
+    player->play_cancel_token = NULL;
+    player->play_request_tag = 0;
+    player->cancel_requested = false;
+    player->stop_preparing_requested = false;
+    PLAYER_MUTEX_UNLOCK(player->cancel_lock);
+
     // 调用 core 层流式播放（PA控制由PLAYING事件回调处理）
     int ret = app_player_core_play_stream(player, sample_rate, channels, bits);
     if (ret != 0) {
@@ -1597,6 +1868,11 @@ int app_player_destroy(app_player_t *player)
     if (player->core_lock) {
         PLAYER_MUTEX_DELETE(player->core_lock);
         player->core_lock = NULL;
+    }
+
+    if (player->cancel_lock) {
+        PLAYER_MUTEX_DELETE(player->cancel_lock);
+        player->cancel_lock = NULL;
     }
 
     // 释放名称内存

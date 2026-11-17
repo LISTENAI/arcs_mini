@@ -4,4 +4,4 @@ tests:
     runner: uart
     log_analyzer:
       type: "regex"
-      pattern: "EVENT_WIFI_INIT_DONE"
+      pattern: "DHCP Success on VIF-\\d+: IP=\\d+\\.\\d+\\.\\d+\\.\\d+"

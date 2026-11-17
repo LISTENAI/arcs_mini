@@ -14,16 +14,37 @@
 #include "alarm_nvs.h"
 #include "kv_user.h"
 #include "voice_msg.h"
+#include "app_datas.h"
 #include "apps/llm/models/model_voice.h"
 #include "service_volume.h"
 #include "service_brightness.h"
+
+static int kv_apply_interaction_mode(app_interaction_mode_t interaction_mode)
+{
+    if (model_voice_interaction_mode_set((int)interaction_mode) != 0) {
+        return -1;
+    }
+
+    voice_msg_pub(VOICE_MSG_CLOUD_MCP_CHAT_EXIT, NULL, 0);
+    return 0;
+}
 
 static int kv_cmd_del(int argc, char **argv)
 {
     if (argc > 0) {
         char *key = argv[0];
+        int current_volume = 0;
+
+        if (!strcmp(key, KV_KEY_USER_MIN_VOLUME)) {
+            current_volume = service_volume_get();
+        }
 
         if (lisa_kv_del(key) == 0) {
+            if (!strcmp(key, KV_KEY_USER_MIN_VOLUME)) {
+                if (service_volume_get() != current_volume) {
+                    service_volume_set(current_volume);
+                }
+            }
             shellPrint(shellGetCurrent(),"flash delete config: %s, success\n", key);
         } else {
             shellPrint(shellGetCurrent(),"flash has no config: %s\n", key);
@@ -72,6 +93,20 @@ static int kv_cmd_set(int argc, char **argv)
                 return -1;
             }
 
+            if (!strcmp(key, KV_KEY_USER_MIN_VOLUME) && (parsed < 0 || parsed > 10)) {
+                shellPrint(shellGetCurrent(),
+                           "flash set %s out of range: %ld (valid range: 0-10)\n",
+                           key, parsed);
+                return -1;
+            }
+
+            if (!strcmp(key, KV_KEY_INT_MODE) && !app_interaction_mode_is_valid((int)parsed)) {
+                shellPrint(shellGetCurrent(),
+                           "flash set %s out of range: %ld (valid range: 0-%d)\n",
+                           key, parsed, APP_INTERACTION_MODE_MAX - 1);
+                return -1;
+            }
+
             int int_temp = (int)parsed;
             if (!strcmp(key, KV_KEY_USER_VOLUME)) {
                 service_volume_set(int_temp);
@@ -87,6 +122,32 @@ static int kv_cmd_set(int argc, char **argv)
                 return 0;
             }
 
+            if (!strcmp(key, KV_KEY_USER_MIN_VOLUME)) {
+                int current_volume = service_volume_get();
+
+                if (lisa_kv_set_int(key, int_temp) != 0) {
+                    shellPrint(shellGetCurrent(),"flash set %s:%d failed\n", key, int_temp);
+                    return -1;
+                }
+
+                if (service_volume_get() != current_volume) {
+                    service_volume_set(current_volume);
+                }
+                shellPrint(shellGetCurrent(),
+                           "set min volume success: %d\n",
+                           int_temp);
+                return 0;
+            }
+
+            if (!strcmp(key, KV_KEY_INT_MODE)) {
+                if (kv_apply_interaction_mode((app_interaction_mode_t)int_temp) != 0) {
+                    shellPrint(shellGetCurrent(), "interaction mode unavailable: wakeup resources require single mode\n");
+                    return -1;
+                }
+                shellPrint(shellGetCurrent(), "interaction mode change requested: %d\n", int_temp);
+                return 0;
+            }
+
             if (lisa_kv_set_int(key, int_temp) != 0) {
                 shellPrint(shellGetCurrent(),"flash set %s:%d failed\n", key, int_temp);
             } else {
@@ -98,10 +159,6 @@ static int kv_cmd_set(int argc, char **argv)
                 shellPrint(shellGetCurrent(),"flash set %s:%d failed\n", key, bool_temp);
             } else {
                 shellPrint(shellGetCurrent(),"flash set %s:%d success\n", key, bool_temp);
-                if (!strcmp(key, KV_KEY_FULL_DUPLEX)) {
-                    model_voice_wakeup_mode_set(bool_temp ? MODEL_VOICE_WAKEUP_MODE_VOICE_MULTI : MODEL_VOICE_WAKEUP_MODE_VOICE_SINGLE);
-                    voice_msg_pub(VOICE_MSG_CLOUD_MCP_CHAT_EXIT, NULL, 0);
-                }
             }
         } else {
             shellPrint(shellGetCurrent(),"invalid type %s\n", type);

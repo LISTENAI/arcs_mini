@@ -9,11 +9,12 @@
  *      INCLUDES
  *********************/
 #include "lv_port_indev.h"
+#ifdef CONFIG_LISA_TOUCH_DEVICE
 #include "lisa_touch.h"
-#include "lisa_device.h"
 #include "lisa_display.h"
 #include <FreeRTOS.h>
 #include <semphr.h>
+#endif
 
 /*********************
  *      DEFINES
@@ -22,6 +23,7 @@
 /**********************
  *      TYPEDEFS
  **********************/
+#ifdef CONFIG_LISA_TOUCH_DEVICE
 struct touch_msg {
     uint16_t x;
     uint16_t y;
@@ -45,6 +47,7 @@ static uint16_t last_y = 0;
 static uint8_t last_state = 0;
 static SemaphoreHandle_t touchpad_sem = NULL;
 static QueueHandle_t touchpad_queue = NULL;
+#endif
 
 /**********************
  *      MACROS
@@ -54,6 +57,7 @@ static QueueHandle_t touchpad_queue = NULL;
  *   GLOBAL FUNCTIONS
  **********************/
 
+#ifdef CONFIG_LISA_TOUCH_DEVICE
 /**
  * @brief Touch interrupt callback function
  *
@@ -181,16 +185,22 @@ static void touchpad_transform_coordinates(lv_coord_t *x, lv_coord_t *y)
 #endif
 
 #if CONFIG_LV_POINTER_INVERT_X
-    cur_x = caps.x_resolution - cur_x;
+    cur_x = caps.width - cur_x;
 #endif
 
 #if CONFIG_LV_POINTER_INVERT_Y
-    cur_y = caps.y_resolution - cur_y;
+    cur_y = caps.height - cur_y;
 #endif
 
     *x = cur_x;
     *y = cur_y;
 }
+#else
+void lv_port_indev_init(lisa_device_t *touch_dev)
+{
+    (void)touch_dev;
+}
+#endif
 
 #else /* Enable this file at the top */
 

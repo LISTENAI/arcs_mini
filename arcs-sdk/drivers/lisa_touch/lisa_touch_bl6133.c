@@ -111,23 +111,19 @@ static int bl6133_read_reg(lisa_device_t *i2c_dev, uint8_t reg, uint8_t *data, u
 static void bl6133_read_task(void *pvParameters)
 {
     lisa_touch_bl6133_priv_t *priv = (lisa_touch_bl6133_priv_t *)pvParameters;
-    
+
     while (1) {
-        /* 等待任务通知（中断会发送通知）
-         * 使用 pdFALSE 清除所有累积的通知，避免重复处理
-         */
-        ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-        
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
         if (!priv->enabled || !priv->interrupt_mode_active) {
             continue;
         }
-        
+
         /* 在任务上下文中读取完整的触摸数据 */
         lisa_touch_event_t event = {0};
         int ret = bl6133_touch_read_event_internal(priv, &event);
-        
+
         if (ret == LISA_DEVICE_OK && priv->callback) {
-            /* 通过回调函数返回完整数据 */
             priv->callback(&event, priv->callback_user_data);
         }
     }
@@ -140,7 +136,7 @@ static void bl6133_gpio_irq_callback(uint32_t pin, void *user_data)
 {
     (void)pin;
     lisa_touch_bl6133_priv_t *priv = (lisa_touch_bl6133_priv_t *)user_data;
-    
+
     if (!priv || !priv->interrupt_mode_active) {
         return;
     }
@@ -406,7 +402,7 @@ static int bl6133_touch_set_int_mode(lisa_device_t *dev, lisa_touch_int_mode_t m
         if (priv->read_task_handle == NULL) {
             /* 使用 Kconfig 配置的任务优先级 */
             UBaseType_t task_priority = tskIDLE_PRIORITY + CONFIG_LISA_TOUCH_ARCS_BL6133_READ_TASK_PRIORITY;
-            xTaskCreate(bl6133_read_task, "bl6133_read", 1024, priv, 
+            xTaskCreate(bl6133_read_task, "bl6133_read", 1024, priv,
                        task_priority, &priv->read_task_handle);
             if (priv->read_task_handle == NULL) {
                 DEVICE_UNLOCK(priv);
@@ -471,10 +467,35 @@ static int lisa_touch_bl6133_init(void)
 }
 
 /* ===== 设备注册 ===== */
-LISA_DEVICE_REGISTER(touch_bl6133,
-                     &bl6133_api,
-                     &touch_bl6133_priv,
-                     NULL,
-                     lisa_touch_bl6133_init,
-                     LISA_DEVICE_LEVEL_NORMAL,
-                     LISA_DEVICE_PRIORITY_NORMAL);
+/**
+ * @brief 停止并释放 BL6133 触摸设备的全部软硬件资源，恢复上电初始状态
+ *
+ * 由 lisa_device_destroy() 调用：关中断 → 删读取任务 → 删 mutex → memset 归零
+ * （i2c/gpio 为外部设备引用、非本驱动持有）。
+ */
+static int lisa_touch_bl6133_deinit(void)
+{
+    lisa_touch_bl6133_priv_t *priv = &touch_bl6133_priv;
+
+    if (priv->interrupt_mode_active && priv->int_gpio) {
+        lisa_gpio_disable_irq(priv->int_gpio, priv->int_pin);
+    }
+    if (priv->read_task_handle) {
+        vTaskDelete(priv->read_task_handle);
+    }
+    if (priv->mutex) {
+        lisa_mutex_delete(priv->mutex);
+    }
+
+    memset(&touch_bl6133_priv, 0, sizeof(lisa_touch_bl6133_priv_t));
+    return LISA_DEVICE_OK;
+}
+
+LISA_DEVICE_REGISTER_DEINIT(touch_bl6133,
+                            &bl6133_api,
+                            &touch_bl6133_priv,
+                            NULL,
+                            lisa_touch_bl6133_init,
+                            lisa_touch_bl6133_deinit,
+                            LISA_DEVICE_LEVEL_NORMAL,
+                            LISA_DEVICE_PRIORITY_NORMAL);

@@ -33,7 +33,7 @@ MEMORY {
 #if CONFIG_MEM_PSRAM_SIZE > 0
     PSRAM(rwxa)  : ORIGIN = CONFIG_MEM_PSRAM_BASE, LENGTH = CONFIG_MEM_PSRAM_SIZE
 #endif
-#if CONFIG_BOOT
+#if CONFIG_BOOT && !CONFIG_BOOT_STANDALONE
     FLASH(rxa!w) : ORIGIN = (CONFIG_MEM_FLASH_BASE + CONFIG_BOOT_FLASH_SIZE), LENGTH = (CONFIG_MEM_FLASH_SIZE - CONFIG_BOOT_FLASH_SIZE)
 #else
     FLASH(rxa!w) : ORIGIN = CONFIG_MEM_FLASH_BASE, LENGTH = CONFIG_MEM_FLASH_SIZE
@@ -77,12 +77,40 @@ SECTIONS {
         /* Default Vector Table */
         . = ALIGN(4);
         PROVIDE(_rom_code_start = .);
-        * (.vtable)
+        KEEP(* (.vtable))
+
+#ifdef CONFIG_BOOT_FEATURES
+        /* Pin uboot features descriptor at CONFIG_BOOT_FEATURES_ADDR so the
+         * application can read a stable flash offset regardless of .vtable
+         * size (see arcs-sdk/system/uboot). */
+        . = ALIGN(4);
+        ASSERT(. <= CONFIG_BOOT_FEATURES_ADDR, ".vtable overlaps uboot_features descriptor");
+        . = CONFIG_BOOT_FEATURES_ADDR - CONFIG_MEM_FLASH_BASE;
+        KEEP(*(.uboot_features))
+        . = ALIGN(4);
+#endif
+
+#if defined(CONFIG_CP_FIRMWARE_COMPAT) && CONFIG_CP_FIRMWARE_COMPAT
+        /* Pin the prj.conf CP PSRAM range immediately after the standard ARCS
+         * image header. AP validates it before releasing the CP core. */
+        . = ALIGN(4);
+        ASSERT(. <= CONFIG_CP_FIRMWARE_COMPAT_OFFSET,
+               ".vtable overlaps CP PSRAM range field");
+        . = CONFIG_CP_FIRMWARE_COMPAT_OFFSET;
+        PROVIDE(__cp_firmware_compat_start = .);
+        KEEP(*(.cp_firmware_compat))
+        KEEP(*(.cp_firmware_compat.*))
+        PROVIDE(__cp_firmware_compat_end = .);
+        ASSERT((__cp_firmware_compat_end - __cp_firmware_compat_start) == 8,
+               "CP firmware PSRAM range field must be 8 bytes");
+        . = ALIGN(4);
+#endif
 
         /* Starup Initialition Region */
         . = ALIGN(4);
         KEEP(startup.* (SORT_NONE(.init)))
         KEEP(scatload.* (SORT(.init)))
+        KEEP(* (.init))
         PROVIDE(_rom_code_end = .);
     } >ROM AT>ROM
 
@@ -100,6 +128,7 @@ SECTIONS {
             SCATLOAD(.text);
             SCATLOAD(.rodata);
             SCATLOAD(.data);
+            SCATLOAD(.tdata);
             #include "generated/snippets-scatload.ld"
         PROVIDE(__scat_copy_last = .);
 
@@ -110,6 +139,7 @@ SECTIONS {
             SCATZERO(.dtcm.bss);
 #endif
             SCATZERO(.fast.bss);
+            SCATZERO(.tbss);
             SCATZERO(.bss);
             #include "generated/snippets-scatzero.ld"
         PROVIDE(__scat_zero_last = .);
@@ -193,9 +223,11 @@ SECTIONS {
 
     .dtcm : ALIGN(4) {
         . = ALIGN(4);
+        PROVIDE(_dtcm_data_start = .);
         * (.dtcm .dtcm.*)
         #include "generated/snippets-relocate-dtcm-data.ld"
         . = ALIGN(4);
+        PROVIDE(_dtcm_data_end = .);
     } >DTCM AT>ROM
 
     .dtcm.bss (NOLOAD) : ALIGN(4) {
@@ -203,6 +235,7 @@ SECTIONS {
         * (.dtcm.bss .dtcm.bss*)
         #include "generated/snippets-relocate-dtcm-bss.ld"
         . = ALIGN(4);
+        PROVIDE(_dtcm_bss_end = .);
     } >DTCM
 #endif
 
@@ -252,6 +285,11 @@ SECTIONS {
         PROVIDE(_rom_code2_end = .);
     } >ROM AT>ROM
 
+    /* Linker-generated Zcmt jump table. The JVT base requires 64-byte alignment. */
+    .riscv.jvt : ALIGN(64) {
+        KEEP(*(.riscv.jvt))
+    } >ROM AT>ROM
+
     /* === SLOT: POST_TEXT — .text 之后的组件段（C++ runtime 等） === */
     #include "generated/snippets-post_text.ld"
 
@@ -292,7 +330,12 @@ SECTIONS {
     /* === SLOT: POST_DATA — .data 之后的组件段 === */
     #include "generated/snippets-post_data.ld"
 
-    PROVIDE(__tls_base = .);
+    .tdata : ALIGN(8) {
+        . = ALIGN(8);
+        PROVIDE(__tls_base = .);
+        *(.tdata .tdata.* .gnu.linkonce.td.*)
+        . = ALIGN(8);
+    } >RAM AT>ROM
 
 #if CONFIG_MEM_PSRAM_SIZE > 0
     .psram.nocache_heap ORIGIN(PSRAM) (NOLOAD):{
@@ -307,6 +350,14 @@ SECTIONS {
 
     ////////////////////////////////////////////////////////////////////////////
     // ZERO => RAM
+    .tbss (NOLOAD) : ALIGN(8) {
+        . = ALIGN(8);
+        *(.tbss .tbss.* .gnu.linkonce.tb.*)
+        *(.tcommon)
+        . = ALIGN(8);
+        PROVIDE(__tls_end = .);
+    } >RAM AT>RAM
+
     .bss(NOLOAD) : ALIGN(8) {
         . = ALIGN(8);
         * (.sbss .sbss.*)
@@ -347,10 +398,45 @@ SECTIONS {
         . += __STACK_SIZE;
         . = ALIGN(16);
         PROVIDE(__StackTop = .);
+        PROVIDE(_sp = .);
         PROVIDE(_estack = .);
 
     } >RAM AT>RAM
 
     /* === SLOT: SECTIONS_END — 末尾组件段 === */
     #include "generated/snippets-sections_end.ld"
+
+    /*
+     * Non-allocatable toolchain metadata is intentionally listed so
+     * --orphan-handling=error only catches real missing runtime sections.
+     */
+    .riscv.attributes 0 : { KEEP(*(.riscv.attributes)) }
+    .comment 0 : { *(.comment .comment.*) }
+    .note.GNU-stack 0 : { *(.note.GNU-stack) }
+
+    .debug_info 0 : { *(.debug_info .debug_info.* .gnu.linkonce.wi.*) }
+    .debug_abbrev 0 : { *(.debug_abbrev) }
+    .debug_aranges 0 : { *(.debug_aranges) }
+    .debug_ranges 0 : { *(.debug_ranges) }
+    .debug_rnglists 0 : { *(.debug_rnglists .debug_rnglists.*) }
+    .debug_line 0 : { *(.debug_line .debug_line.*) }
+    .debug_line_str 0 : { *(.debug_line_str) }
+    .debug_str 0 : { *(.debug_str .debug_str.*) }
+    .debug_loc 0 : { *(.debug_loc) }
+    .debug_loclists 0 : { *(.debug_loclists .debug_loclists.*) }
+    .debug_frame 0 : { *(.debug_frame) }
+    .debug_macro 0 : { *(.debug_macro .debug_macro.*) }
+    .debug_addr 0 : { *(.debug_addr .debug_addr.*) }
+    .debug_str_offsets 0 : { *(.debug_str_offsets .debug_str_offsets.*) }
+    .debug_pubnames 0 : { *(.debug_pubnames) }
+    .debug_pubtypes 0 : { *(.debug_pubtypes) }
+    .debug_gnu_pubnames 0 : { *(.debug_gnu_pubnames) }
+    .debug_gnu_pubtypes 0 : { *(.debug_gnu_pubtypes) }
+    .debug_names 0 : { *(.debug_names) }
+    .debug_sup 0 : { *(.debug_sup) }
+    .debug_cu_index 0 : { *(.debug_cu_index) }
+    .debug_tu_index 0 : { *(.debug_tu_index) }
+    .debug_other 0 : { *(.debug_*) }
+
+    .relocs 0 : { *(.rel*) *(.rela*) }
 }

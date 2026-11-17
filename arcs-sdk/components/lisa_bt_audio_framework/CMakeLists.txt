@@ -14,6 +14,7 @@ if(CONFIG_LISA_BT_AUDIO_FRAMEWORK)
         core/bt_audio_framework.c
         core/bt_audio_codec_mgr.c
         core/bt_audio_session_mgr.c
+        core/bt_audio_stream_lifecycle.c
     )
 
     # Codec适配器源文件
@@ -43,6 +44,8 @@ if(CONFIG_LISA_BT_AUDIO_FRAMEWORK)
     if(CONFIG_LISA_BT_AUDIO_INTERFACE_LOCAL)
         listenai_library_sources(
             interfaces/lisa_audio_interface.c
+            interfaces/lisa_audio_resampler.c
+            interfaces/lisa_audio_playback_resample.c
         )
     endif()
     

@@ -15,8 +15,17 @@ if (DEFINED CONFIG_ADB)
     listenai_library_sources_ifdef(
         CONFIG_ADB_SYNC
         adb_sync.c
+        adb_sync_stage.c
+        adb_sync_metadata.c
         adb_sync_ext_disk.c
     )
 
-    listenai_include_directories(./)
+    listenai_library_sources_ifdef(
+        CONFIG_ADB_REBOOT
+        adb_reboot.c
+    )
+
+    listenai_include_directories(
+        ./
+    )
 endif()

@@ -34,6 +34,13 @@ extern "C" {
 /** 内容文本最大长度 */
 #define LISA_UI_LLM_PRIMARY_MAX_CONTENT_LENGTH 256
 
+/** 设备待机状态栏文案 */
+#ifdef CONFIG_BOARD_ARCS_MINI3
+#define LISA_UI_LLM_PRIMARY_STANDBY_TEXT "Arcs-Mini3"
+#else
+#define LISA_UI_LLM_PRIMARY_STANDBY_TEXT "Arcs-Mini2"
+#endif
+
 /** 类型检查宏 */
 #define LISA_UI_LLM_PRIMARY_CLASS_CHECK(obj) (lv_obj_has_class(obj, &lisa_ui_llm_primary_class))
 
@@ -54,8 +61,14 @@ struct lisa_ui_llm_primary {
 #endif
     lv_obj_t *wifi_icon;     /*!< WiFi图标 */
     lv_obj_t *full_duplex_icon; /*!< 交互模式图标（全双工） */
+    lv_obj_t *tf_card_icon;  /*!< TF 卡图标 */
+    lv_obj_t *usb_icon;      /*!< USB Host 图标 */
     lv_obj_t *alarm_icon;    /*!< 闹钟图标 */
+    lv_obj_t *status_icon_container; /*!< USB/闹钟图标容器 */
+    bool status_icons_usb_first;
     lv_obj_t *battery_icon;  /*!< 电量图标 */
+    uint32_t status_icons_visibility;
+    bool status_icons_suppressed;
     lv_obj_t *status_label;  /*!< 状态文本标签 */
 
     /* 容器内容元素 */
@@ -65,6 +78,9 @@ struct lisa_ui_llm_primary {
     lv_obj_t *content_label;     /*!< 内容文本标签 */
     lv_obj_t *img;
     lv_obj_t *img_hint;
+    lv_obj_t *finger_hint_icon;
+    lv_obj_t *finger_hint_label;
+    lv_obj_t *power_key_hint;
 };
 
 /** LLM UI主要组件类型定义 */
@@ -193,12 +209,36 @@ void lisa_ui_llm_primary_set_wifi_img(lv_obj_t *obj, const void *img_path);
 void lisa_ui_llm_primary_set_full_duplex_icon_visible(lv_obj_t *obj, bool visible);
 
 /**
+ * @brief 设置交互模式图标图片
+ *
+ * @param obj LLM UI主要组件对象
+ * @param img_path 图片路径，如果为NULL则不更新图片
+ */
+void lisa_ui_llm_primary_set_full_duplex_icon_img(lv_obj_t *obj, const void *img_path);
+
+/**
+ * @brief 设置 TF 卡图标显示状态
+ * @param obj LLM UI 主要组件对象
+ * @param visible true 显示，false 隐藏
+ */
+void lisa_ui_llm_primary_set_tf_card_icon_visible(lv_obj_t *obj, bool visible);
+
+void lisa_ui_llm_primary_set_usb_icon_visible(lv_obj_t *obj, bool visible);
+
+/**
  * @brief 设置闹钟图标显示状态
  *
  * @param obj LLM UI主要组件对象
  * @param visible true显示，false隐藏
  */
 void lisa_ui_llm_primary_set_alarm_icon_visible(lv_obj_t *obj, bool visible);
+
+/**
+ * @brief 临时隐藏或恢复状态栏图标
+ *
+ * 状态文本不受影响。恢复时使用调用隐藏前及隐藏期间最新的图标状态。
+ */
+void lisa_ui_llm_primary_set_status_icons_visible(lv_obj_t *obj, bool visible);
 
 /**
  * @brief 设置电量图标显示状态
@@ -270,6 +310,18 @@ void lisa_ui_llm_primary_show_camera_image(lv_obj_t *obj, const uint16_t *rgb565
  */
 void lisa_ui_llm_primary_hide_camera_image(lv_obj_t *obj);
 lv_obj_t *lisa_ui_llm_primary_emoji_anim_get(lv_obj_t *obj);
+
+/**
+ * @brief 设置表情动画的横向和纵向偏移
+ *
+ * @param obj LLM UI主要组件对象
+ * @param offset_x 横向偏移值（正数向右，负数向左，单位像素）
+ * @param offset_y 纵向偏移值（正数向下，负数向上，单位像素）
+ *
+ * @note 表情中心点相对于屏幕中心点偏移
+ */
+void lisa_ui_llm_primary_set_emoji_offset(lv_obj_t *obj, int offset_x, int offset_y);
+
 /*===========================================
  * 内联函数
  *==========================================*/
@@ -286,9 +338,17 @@ static inline bool lisa_ui_llm_primary_is_valid(lv_obj_t *obj)
     return (obj != NULL) && LISA_UI_LLM_PRIMARY_CLASS_CHECK(obj);
 }
 void lisa_ui_llm_primary_img_show(lv_obj_t *obj, void *img);
+void lisa_ui_llm_primary_query_img_show(lv_obj_t *obj, const void *img);
 void lisa_ui_llm_primary_img_hide(lv_obj_t *obj);
+bool lisa_ui_llm_primary_img_is_visible(lv_obj_t *obj);
 void lisa_ui_llm_primary_img_hint_show(lv_obj_t *obj, const char *text);
 void lisa_ui_llm_primary_img_hint_hide(lv_obj_t *obj);
+void lisa_ui_llm_primary_finger_hint_show(lv_obj_t *obj, const char *text);
+void lisa_ui_llm_primary_finger_hint_hide(lv_obj_t *obj);
+void lisa_ui_llm_primary_finger_hint_icon_hide(lv_obj_t *obj);
+lv_obj_t *lisa_ui_llm_primary_power_key_hint_create(lv_obj_t *parent);
+void lisa_ui_llm_primary_power_key_hint_show(lv_obj_t *obj);
+void lisa_ui_llm_primary_power_key_hint_hide(lv_obj_t *obj);
 
 #ifdef __cplusplus
 } /* extern "C" */

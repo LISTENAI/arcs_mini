@@ -214,6 +214,12 @@ enum bt_hfp_phb_vr_res
     BT_HF_VR_RES_ANS_APPEND,
 };
 
+enum bt_hfp_at_codec_type
+{
+    BT_BAC_HF_CODEC_TYPE = 0,
+    BT_BCS_HF_CODEC_TYPE = 1,
+};
+
 typedef enum
 {
     HFP_MEDIA_CODEC_AUTO = 0,
@@ -324,7 +330,7 @@ typedef struct bt_hfp_cb
      * @brief hfp send media complete.
      ****************************************************************************************
      */
-    void (*cb_hfp_send_media_cmp)(uint8_t conidx, uint16_t status, uint8_t *data);
+    void (*cb_hfp_send_media_cmp)(uint8_t conidx, uint8_t status, uint8_t *data);
 
     /**
      ****************************************************************************************
@@ -490,6 +496,19 @@ void app_hfp_disable(void);
  * @return status.
  */
 int app_hfp_send_aud_to_peer(uint8_t conidx, uint16_t len, uint8_t *data);
+
+/**
+ * hfp connect
+ *
+ * @param conidx.
+ *
+ * @param role.
+ *
+ * @return status.
+ */
+
+void app_hfp_connect(uint8_t conidx, uint8_t role);
+
 
 #endif
 

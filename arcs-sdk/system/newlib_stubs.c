@@ -149,8 +149,10 @@ _ssize_t _write_r(struct _reent *r, int file, const void *ptr, size_t len)
             return len;
         }
 #endif
+#if CONFIG_CONSOLE
         extern int console_write(const char *data, int len);
         console_write(ptr, len);
+#endif
         return len;
     default:
         return _write(file, (char *)ptr, len);

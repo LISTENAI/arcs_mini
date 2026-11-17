@@ -11,16 +11,26 @@ if LISA_AUDIO_DEVICE
 
 choice
 	prompt "Audio Implementation"
+	default PORT_VENUSA if SOC_VENUSA
 	default PORT_ARCS
 	help
 			Select the audio driver implementation.
 
 config PORT_ARCS
 	bool "Use ARCS port implementation"
+	depends on SOC_ARCS
 	help
 			Enable ARCS platform specific implementation.
 
+config PORT_VENUSA
+	bool "Use Venusa port implementation"
+	depends on SOC_VENUSA
+	help
+			Enable Venusa platform specific implementation.
+
 endchoice
+
+rsource "port/venusa/Kconfig"
 
 config LISA_AUDIO_INIT_PRIORITY
 	int "Audio device initialization priority"
@@ -51,6 +61,7 @@ menu "Record (ADC) Configuration"
 
 config LISA_AUDIO_RECORD_USE_PIPO
 	bool "Enable Record PiPo (Ping-Pong) mode"
+	depends on PORT_ARCS
 	default y
 	help
 			Enable Ping-Pong buffer mode for continuous audio recording.
@@ -61,12 +72,12 @@ config LISA_AUDIO_RECORD_USE_DMIC
 			Enable PDM mode for digital microphones.
 			Disable for analog microphones (ADC mode).
 
-config  LISA_AUDIO_RECORD_INDIVIDUAL_GAIN
-    bool "Enable individual gain control on left/right channels"
-    default n
+config LISA_AUDIO_RECORD_INDIVIDUAL_GAIN
+	bool "Enable individual gain control on left/right channels"
 
 config LISA_AUDIO_RECORD_MIC0_ENABLE
 	bool "Enable MIC0 (GPIOA_30/31)"
+	depends on PORT_ARCS
 	default y
 	help
 			Enable MIC0 differential input on GPIOA_30 (INP) and GPIOA_31 (INN).
@@ -74,6 +85,7 @@ config LISA_AUDIO_RECORD_MIC0_ENABLE
 
 config LISA_AUDIO_RECORD_MIC1_ENABLE
 	bool "Enable MIC1 (GPIOA_28/29)"
+	depends on PORT_ARCS
 	default y
 	help
 			Enable MIC1 differential input on GPIOA_28 (INP) and GPIOA_29 (INN).
@@ -81,6 +93,7 @@ config LISA_AUDIO_RECORD_MIC1_ENABLE
 
 config LISA_AUDIO_RECORD_DMA_CHN_LEFT
 	int "ADC left channel DMA channel number"
+	depends on PORT_ARCS
 	default 1
 	range 0 5
 	help
@@ -89,6 +102,7 @@ config LISA_AUDIO_RECORD_DMA_CHN_LEFT
 
 config LISA_AUDIO_RECORD_DMA_CHN_RIGHT
 	int "ADC right channel DMA channel number"
+	depends on PORT_ARCS
 	default 3
 	range 0 5
 	help
@@ -101,6 +115,7 @@ config LISA_AUDIO_RECORD_DMA_CHN_RIGHT
 
 choice
 	prompt "LDOVA Output Voltage Level"
+	depends on PORT_ARCS
 	default LISA_AUDIO_RECORD_LDOVA_1V905
 	help
 			Select the LDOVA (Low Dropout Voltage for Analog) output voltage level.
@@ -141,6 +156,7 @@ menu "Play (DAC) Configuration"
 
 config LISA_AUDIO_PLAY_DMA_CHN
 	int "DAC output DMA channel number"
+	depends on PORT_ARCS
 	default 2
 	range 0 5
 	help
@@ -149,6 +165,7 @@ config LISA_AUDIO_PLAY_DMA_CHN
 
 config LISA_AUDIO_PLAY_PA_ENABLE
 	bool "Enable power amplifier (PA) control"
+	depends on PORT_ARCS
 	select LISA_GPIO_DEVICE
 	help
 			Enable GPIO control for external power amplifier.
@@ -190,19 +207,41 @@ config LISA_AUDIO_PLAY_PA_PULSE_US
 
 endif # LISA_AUDIO_PLAY_PA_ENABLE
 
-config LISA_AUDIO_PLAY_ECHO_ENABLE
-	bool "Enable Play Echo capture"
+choice LISA_AUDIO_PLAY_ECHO_MODE
+	prompt "Play Echo mode"
+	default LISA_AUDIO_PLAY_ECHO_NONE
 	help
-			Enable Echo capture during playback. Echo data is a copy of the
-			DAC output signal, useful for AEC (Acoustic Echo Cancellation).
+		Select echo capture mode for AEC (Acoustic Echo Cancellation).
 
-			IMPORTANT: Echo DMA channel (LISA_AUDIO_PLAY_ECHO_DMA_CHN) must not
-			conflict with Record right channel (LISA_AUDIO_RECORD_DMA_CHN_RIGHT).
+config LISA_AUDIO_PLAY_ECHO_NONE
+	bool "Disable Echo"
+	help
+		No echo capture. AEC will not be available.
 
-if LISA_AUDIO_PLAY_ECHO_ENABLE
+config LISA_AUDIO_PLAY_ECHO_ENABLE
+	bool "Hardware Echo (DAC echo DMA)"
+	help
+		Enable hardware Echo capture during playback. Echo data is a copy of the
+		DAC output signal captured via DMA.
+
+		IMPORTANT: Uses DMA channel 3 (GPDMA_ECHO_CHN), which conflicts
+		with Record stereo mode (GPDMA_ADC1_CHN = 3) and I2S1 full-duplex mode.
+
+config LISA_AUDIO_PLAY_SOFT_ECHO
+	bool "Software Echo (playback data copy)"
+	help
+		Enable software echo capture during playback. Instead of using
+		hardware DAC echo (which requires DMA channel 3), the playback
+		data is copied as echo reference for AEC.
+
+		Use this when hardware echo conflicts with other DMA resources
+		(e.g., I2S1 full-duplex mode).
+
+endchoice
 
 config LISA_AUDIO_PLAY_ECHO_DMA_CHN
 	int "Echo capture DMA channel number"
+	depends on LISA_AUDIO_PLAY_ECHO_ENABLE && PORT_ARCS
 	default 3
 	range 0 5
 	help
@@ -211,8 +250,6 @@ config LISA_AUDIO_PLAY_ECHO_DMA_CHN
 
 			NOTE: Must not conflict with LISA_AUDIO_RECORD_DMA_CHN_RIGHT when
 			stereo recording is enabled.
-
-endif # LISA_AUDIO_PLAY_ECHO_ENABLE
 
 config LISA_AUDIO_RECORD_BUFFER_COUNT
 	int "Record buffer count"

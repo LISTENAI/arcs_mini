@@ -7,15 +7,20 @@
 #include "voice_msg.h"
 #include "evs_utils.h"
 #include "remote_logger.h"
-#include "ipc_master.h"
+#include "ic_message.h"
 #include "app_wakeup.h"
 #include "voice_player_comm.h"
 #include "lisa_bluetooth.h"
+#include "sys_network_manager.h"
+#include "sys_wifi.h"
+#include "board.h"
+#include "project_version.h"
 
 #if CONFIG_FILE_SYSTEM
 #include "lsfs.h"
 #include "disk/disk_access.h"
 #include "lisa_sdmmc.h"
+#include "lisa_gpio.h"
 #endif
 
 #include "romfs.h"
@@ -26,13 +31,6 @@
 
 #define TAG "platform"
 #include "lisa_log.h"
-
-#if CONFIG_LISA_MODEM
-#include "ml307_modem.h"
-#endif
-
-#define AT_4G_UART_DEVICE              "uart2"        /* UART device name */
-
 
 #ifdef CONFIG_BOARD_ARCS_MINI
 #define TONE_BIN_ADDR       (CMN_FLASH_REGION + 0x00100000)
@@ -54,6 +52,42 @@ static struct lsfs_mount_t sdmmc_mnt = {
     .mnt_point = SDMMC_MOUNT_POINT,
     .fs_data = NULL,
 };
+
+struct lsfs_mount_t *platform_sd_mount_get(void)
+{
+    return &sdmmc_mnt;
+}
+
+static bool platform_tf_card_inserted(void)
+{
+#ifdef TF_DET_DEVICE_NAME
+    lisa_device_t *tf_det_dev = lisa_device_get(TF_DET_DEVICE_NAME);
+    if (!lisa_device_ready(tf_det_dev)) {
+        LOGW("TF detect device %s PD%d not ready", TF_DET_DEVICE_NAME, TF_DET_PIN);
+        return false;
+    }
+
+    int ret = lisa_gpio_configure(tf_det_dev, TF_DET_PIN, LISA_GPIO_INPUT);
+    if (ret != 0) {
+        LOGW("TF detect %s PD%d configure failed: %d", TF_DET_DEVICE_NAME, TF_DET_PIN, ret);
+        return false;
+    }
+
+    int level = lisa_gpio_read_pin(tf_det_dev, TF_DET_PIN);
+    if (level < 0) {
+        LOGW("TF detect %s PD%d read failed: %d", TF_DET_DEVICE_NAME, TF_DET_PIN, level);
+        return false;
+    }
+
+    bool inserted = level == (TF_DET_ACTIVE_LEVEL ? LISA_GPIO_HIGH : LISA_GPIO_LOW);
+    LOGI("TF detect %s PD%d level=%d active_level=%d inserted=%d",
+         TF_DET_DEVICE_NAME, TF_DET_PIN, level, TF_DET_ACTIVE_LEVEL, inserted);
+
+    return inserted;
+#else
+    return true;
+#endif
+}
 #endif
 
 static void *cjson_malloc(size_t sz)
@@ -96,62 +130,62 @@ int arcs_nvs_init(void)
 
 static int voice_platform_init(void)
 {
+    LISA_LOGI(TAG,"Firmware version: %s-%s", PROJECT_VERSION_STR, PROJECT_VERSION_COMMIT);
     LISA_LOGI(TAG,"Solution build time: %s %s", __DATE__, __TIME__);
-    struct ipc_master_cb_tag ipc_cb = {
-        .wifi_tx_data_cfm   = NULL,
-        .wifi_rx_data       = NULL,
-        .indication_handler = NULL
-    };
     heap_caps_malloc_extmem_enable(16);
     cJSON_InitHooks(&cjson_hooks);
 
     ls_sys_init(8);
 
-    ipc_mem_init(1);
-    int ipc_ready = (ipc_master_init(&ipc_cb) == 0);
+    /* HAL IPC is initialized by the SDK before the application. LSF uses its
+     * own initialization and must not be gated by the HAL link signal. */
+    int ipc_ready = (ic_message_init() == IC_MESSAGE_ERR_NONE);
 
 #if CONFIG_LISA_SHELL
     lisa_shell_init();
     // lisa_log_backend_add("user.shell", log_shell_backend_output, NULL);
 #endif
-    /**
-     * AP侧先核间通信建立后再进行wifi初始化
-     * 此处先进行核间通信的建立
-     */
-
     if (ipc_ready) {
-        ic_message_init();
         LISA_LOGI(TAG, "IC message init end");
     } else {
-        LISA_LOGW(TAG, "IPC not ready, skip ic_message_init");
+        LISA_LOGW(TAG, "IC message init failed, AP may not be ready");
     }
 
-#ifdef CONFIG_FILE_SYSTEM
-    lisa_sdmmc_probe(lisa_device_get("sdmmc0"));
+#if CONFIG_FILE_SYSTEM
     disk_init(NULL);
 #if CONFIG_LVFS_POSIX_API
     lvfs_init();
 #endif
     lsfs_init();
 
-    if (lsfs_mount(&sdmmc_mnt) != 0) {
-        LOGI("Mount failed, formatting...");
-        if (lsfs_mkfs(LSFS_FATFS, SDMMC_DEVICE, NULL, 0) == 0) {
-            if (lsfs_mount(&sdmmc_mnt) == 0) {
-                LOGI("Mounted %s successfully\n", SDMMC_MOUNT_POINT);
-            }
+    if (platform_tf_card_inserted()) {
+        lisa_sdmmc_probe(lisa_device_get("sdmmc0"));
+
+        if (lsfs_mount(&sdmmc_mnt) != 0) {
+            /*
+             * Never format an inserted card automatically.  FatFs cannot
+             * mount NTFS (or any other unsupported/corrupt filesystem), and
+             * formatting here would destroy the user's data.  Leave the
+             * card unmounted; the SD service will report it as unavailable.
+             */
+            LOGW("Failed to mount %s; filesystem unsupported or invalid, skip without formatting",
+                 SDMMC_MOUNT_POINT);
         } else {
-            LOGE("Failed to mount filesystem: %d");
+            LOGI("Mounted %s successfully\n", SDMMC_MOUNT_POINT);
         }
     } else {
-        LOGI("Mounted %s successfully\n", SDMMC_MOUNT_POINT);
+        LOGI("TF card not inserted, skip SD mount");
     }
 #endif
 
     // Check if KV storage is already initialized (e.g., from factory reset)
     lisa_kv_init();
     app_datas_init();
-    user_usb_start();
+    int usb_ret = user_usb_start();
+    if (usb_ret != 0) {
+        LISA_LOGE(TAG, "USB initialization failed: %d", usb_ret);
+        return usb_ret;
+    }
     /* USB-MSC模式下, 不运行应用程序, 只支持USB文件传输 */
     if (app_usb_msc_enabled()) {
         LISA_LOGW(TAG," Enter USB MSC mode, application will not start.\n");
@@ -169,10 +203,6 @@ static int voice_platform_init(void)
     sal_init();
     #endif
     
-    #if CONFIG_LISA_MODEM
-    lisa_modem_module_init(AT_4G_UART_DEVICE);
-    #endif
-
     if (ipc_ready) {
         network_probe_init();
         sys_wifi_init();
@@ -309,6 +339,7 @@ static int voice_platform_init(void)
 
     LISA_LOGI(TAG, "tone init end");
     voice_player_platform_init();
+    sys_network_manager_init(ipc_ready);
 
 #ifdef CONFIG_BOARD_ARCS_MINI
     extern int lisa_ui_anim_init(uint32_t flash_addr, uint32_t flash_size);
@@ -332,15 +363,3 @@ static int voice_platform_init(void)
 }
 
 SYS_INIT(voice_platform_init, SYS_INIT_LEVEL_PRE_APPLICATION, 60);
-
-#if CONFIG_LISA_FLASH_ARCS_HALT_REMOTE_CORE && CONFIG_WIFI_LWIP_SAME_CORE
-static int app_ipc_init(void)
-{
-    ic_lock_init();
-    ipc_master_init(NULL);
-
-    return 0;
-}
-
-SYS_INIT(app_ipc_init,SYS_INIT_LEVEL_PRE_DEVICES_INIT,5); /* 优先级 */
-#endif

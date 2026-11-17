@@ -54,8 +54,29 @@ static int __lisa_player_core_callback_handler(PlayerEvt evt, int arg1, int arg2
     // === Core 层职责 3: 特殊事件处理（纯播放器逻辑）===
     switch (evt) {
         case PLAYER_EVT_PREPARED: {
-            if (lisa_player_play(player->hld) == PLAYER_OP_FAIL) {
-                LISA_LOGE(TAG, "Core: Auto play failed: %s", player->name);
+            PLAYER_MUTEX_LOCK(player->cancel_lock, LISA_OS_WAIT_FOREVER);
+            if (player->stop_preparing_requested ||
+                __app_player_play_cancelled_locked(player)) {
+                LISA_LOGI(TAG, "Core: %s prepared ignored due to stop request", player->name);
+                player->prepare_error = true;
+                /* 不在这里调 lisa_player_reset：实测无论 pre_close 与否，从 PREPARED
+                 * 状态调 reset 都不会真正把状态机带回 IDLE，后续 play_ex 还是看到
+                 * state=PREPARED，core_play 再 reset 会卡死。
+                 *
+                 * 残留的 PREPARED 状态留给下一次 app_player_play_ex 走 play+stop_sync
+                 * 排空（PREPARED → PLAYING → STOPPED → reset 成功）。期间用
+                 * drain_in_progress 标志抑制上层回调，避免 PA 抖动与虚假 TTS 事件。 */
+                lisa_semaphore_give(player->preparing_sem);
+                PLAYER_MUTEX_UNLOCK(player->cancel_lock);
+                break;
+            }
+            /* Enable the PA before the decoder can submit its first PCM frame. */
+            __app_player_pa_acquire(player);
+            PlayerErr play_ret = lisa_player_play(player->hld);
+            if (play_ret != PLAYER_OK) {
+                LISA_LOGE(TAG, "Core: Auto play failed: %s, ret=%d",
+                          player->name, play_ret);
+                __app_player_pa_release(player, 0);
                 player->prepare_error = true;
                 // 播放失败，通知上层处理错误
                 if (player->core_upper_callback) {
@@ -63,9 +84,11 @@ static int __lisa_player_core_callback_handler(PlayerEvt evt, int arg1, int arg2
                         (app_player_core_callback_t)player->core_upper_callback;
                     cb(player, PLAYER_EVT_ERROR, true);
                 }
+                PLAYER_MUTEX_UNLOCK(player->cancel_lock);
                 return 0;
             }
             lisa_semaphore_give(player->preparing_sem);
+            PLAYER_MUTEX_UNLOCK(player->cancel_lock);
             break;
         }
 
@@ -95,7 +118,10 @@ static int __lisa_player_core_callback_handler(PlayerEvt evt, int arg1, int arg2
     player->last_evt = evt;
 
     // === Core 层职责 7: 调用上层回调（通知 PA、焦点管理等）===
-    if (player->core_upper_callback) {
+    /* drain_in_progress 期间（play_ex 走 play+stop_sync 排空残留 PREPARED 状态）
+     * 跳过上层回调，避免 PA 闪烁、焦点抖动以及虚假的 PLAYING/STOPPED 事件
+     * 被业务层当成真实播放收到。 */
+    if (player->core_upper_callback && !player->drain_in_progress) {
         app_player_core_callback_t cb =
             (app_player_core_callback_t)player->core_upper_callback;
         cb(player, evt, should_notify_user);
@@ -350,9 +376,11 @@ int app_player_core_resume(app_player_t *player)
     // 如果是在准备阶段被暂停的，清除pause_preparing标志并开始播放
     if (player->pause_preparing) {
         player->pause_preparing = false;
+        __app_player_pa_acquire(player);
         PlayerErr ret = lisa_player_play(player->hld);
         if (ret != PLAYER_OK) {
             LISA_LOGE(TAG, "Core resume failed: lisa_player_play error %d", ret);
+            __app_player_pa_release(player, 0);
             PLAYER_MUTEX_UNLOCK(player->core_lock);
             return -1;
         }
@@ -361,9 +389,11 @@ int app_player_core_resume(app_player_t *player)
     }
 
     // 调用底层的恢复接口
+    __app_player_pa_acquire(player);
     PlayerErr ret = lisa_player_resume(player->hld);
     if (ret != PLAYER_OK) {
         LISA_LOGE(TAG, "Core resume failed: lisa_player_resume error %d", ret);
+        __app_player_pa_release(player, 0);
         PLAYER_MUTEX_UNLOCK(player->core_lock);
         return -1;
     }
@@ -388,9 +418,11 @@ int app_player_core_resume_sync(app_player_t *player)
     // 如果是在准备阶段被暂停的，清除pause_preparing标志并开始播放
     if (player->pause_preparing) {
         player->pause_preparing = false;
+        __app_player_pa_acquire(player);
         PlayerErr ret = lisa_player_play(player->hld);
         if (ret != PLAYER_OK) {
             LISA_LOGE(TAG, "Core resume sync failed: lisa_player_play error %d", ret);
+            __app_player_pa_release(player, 0);
             PLAYER_MUTEX_UNLOCK(player->core_lock);
             return -1;
         }
@@ -399,9 +431,11 @@ int app_player_core_resume_sync(app_player_t *player)
     }
 
     // 调用底层的同步恢复接口
+    __app_player_pa_acquire(player);
     PlayerErr ret = lisa_player_resume_sync(player->hld);
     if (ret != PLAYER_OK) {
         LISA_LOGE(TAG, "Core resume sync failed: lisa_player_resume_sync error %d", ret);
+        __app_player_pa_release(player, 0);
         PLAYER_MUTEX_UNLOCK(player->core_lock);
         return -1;
     }
@@ -449,6 +483,26 @@ int app_player_core_stop_sync(app_player_t *player)
     LISA_LOGI(TAG, "Core stop sync: %s", player->name);
 
     PLAYER_MUTEX_LOCK(player->core_lock, LISA_OS_WAIT_FOREVER);
+
+    /* A cancelled URL can finish preparing without ever playing. The decoder
+     * cannot stop/reset directly from PREPARED. Use the same silent drain as
+     * play_ex: do not acquire PA or publish its intermediate PLAYING event. */
+    if (lisa_player_get_state(player->hld) == PLAYER_ST_PREPARED) {
+        player->drain_in_progress = true;
+        int drain_ret = lisa_player_play(player->hld);
+        if (drain_ret == PLAYER_OK) drain_ret = lisa_player_stop_sync(player->hld);
+        player->drain_in_progress = false;
+        if (drain_ret != PLAYER_OK) {
+            LISA_LOGW(TAG, "Core stop: prepared drain failed: %d", drain_ret);
+            PLAYER_MUTEX_UNLOCK(player->core_lock);
+            return -1;
+        }
+        player->is_preparing = false;
+        player->pause_preparing = false;
+        __enqueue_callback_event(player, APP_PLAYER_EVENT_STOPPED);
+        PLAYER_MUTEX_UNLOCK(player->core_lock);
+        return 0;
+    }
 
     int ret = lisa_player_stop_sync(player->hld);
     if (ret != PLAYER_OK) {

@@ -1,16 +1,22 @@
 listenai_library_named(shell_cmds)
 
 listenai_library_sources(
-    kv.c
-    # player.c
-    sys.c
-    wifi.c
-    ble.c
     # app.c
+    ble.c
+    # fs.c
     heap.c
     id_cmd.c
-    # fs.c
-    mic_bias.c
     interact.c
+    kv.c
+    # listen_cmd.c
+    # log.c
+    mic_bias.c
+    # player.c
+    sd.c
+    sys.c
     version.c
+    wifi.c
 )
+
+listenai_library_sources_ifdef(CONFIG_CHERRYUSB_HOST_CDC_ACM usb_serial.c)
+listenai_include_directories(${CMAKE_CURRENT_LIST_DIR}/../../middleware/usb)

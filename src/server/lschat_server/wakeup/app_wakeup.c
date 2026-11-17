@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <math.h>
+#include <stdlib.h>
+#include <errno.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -27,6 +29,9 @@
 #include "cmd/cmd.h"
 #include "Driver_ADC_PDM.h"
 #include "Driver_DAC.h"
+#if CONFIG_WIFI
+#include "sys_wifi.h"
+#endif
 #endif // CONFIG_BOARD_ARCS_MINI
 
 /* Audio parameters */
@@ -38,9 +43,30 @@
 #define BUFFER_SAMPLES      256
 
 #ifdef CONFIG_BOARD_ARCS_MINI
+#define AUDIO_STANDBY_PLAYBACK_WARMUP_MS 50U
+#define AUDIO_STANDBY_RECORD_WARMUP_MS   20U
+
 static bool s_wakeup_started = false;
+static bool s_audio_adc_low_power = false;
+static bool s_audio_reference_channel_off = false;
+static bool s_audio_playback_off = false;
+static SemaphoreHandle_t s_audio_power_mutex = NULL;
+static app_wakeup_audio_diag_t s_audio_diag;
 #endif
 static bool s_audio_inited = false;
+static bool s_wakeup_feed_enabled = false;
+/* Wakeword is optional: a resource/AP version mismatch must not disable the
+ * rest of the voice service or button-to-talk path. */
+static bool s_wakeup_available = true;
+/* Latched until reboot/init; IPC and audio tasks share this flag. */
+static uint32_t s_wakeup_runtime_failed;
+
+static bool wakeup_runtime_failed(void)
+{
+    return __atomic_load_n(&s_wakeup_runtime_failed, __ATOMIC_ACQUIRE) != 0U;
+}
+static bool s_audio_callback_registered = false;
+static TickType_t s_last_wakeup_keyword_tick = 0;
 
 lisa_device_t *g_audio_dev = NULL;
 #ifdef CONFIG_BOARD_ARCS_MINI
@@ -62,12 +88,68 @@ static int32_t g_play_digital_gain = -20;
 
 static app_wakeup_sensitivity_level_e s_sensitivity_level = APP_WAKEUP_SENSITIVITY_LEVEL_2;
 
+#ifdef CONFIG_BOARD_ARCS_MINI
+static bool app_wakeup_audio_standby_active(void)
+{
+    return s_audio_adc_low_power || s_audio_reference_channel_off ||
+           s_audio_playback_off;
+}
+
+static void app_wakeup_audio_diag_sync_state(void)
+{
+    s_audio_diag.adc_low_power = s_audio_adc_low_power;
+    s_audio_diag.reference_channel_off = s_audio_reference_channel_off;
+    s_audio_diag.playback_off = s_audio_playback_off;
+}
+
+static void app_wakeup_audio_diag_begin_wake(void)
+{
+    taskENTER_CRITICAL();
+    s_audio_diag.wake_count++;
+    s_audio_diag.record_events_since_wake = 0U;
+    s_audio_diag.input_submit_failures_since_wake = 0U;
+    s_audio_diag.output_buffers_since_wake = 0U;
+    s_audio_diag.output_bytes_since_wake = 0U;
+    s_audio_diag.cloud_frames_since_wake = 0U;
+    s_audio_diag.mic_bypass_frames_since_wake = 0U;
+    s_audio_diag.cloud_non_silent_frames_since_wake = 0U;
+    s_audio_diag.cloud_send_failures_since_wake = 0U;
+    s_audio_diag.last_cloud_peak = 0U;
+    taskEXIT_CRITICAL();
+}
+
+void app_wakeup_audio_diag_get(app_wakeup_audio_diag_t *diag)
+{
+    if (diag == NULL) {
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    *diag = s_audio_diag;
+    taskEXIT_CRITICAL();
+}
+#endif
+
+static uint32_t app_wakeup_get_esr_timeout_ms(void)
+{
+    int timeout_ms = 0;
+#ifdef CONFIG_BOARD_ARCS_MINI
+    if (lisa_kv_get_int(KV_KEY_IDLE_EXIT_TIMEOUT_MS, &timeout_ms) == 0 && timeout_ms > 0) {
+        return (uint32_t)timeout_ms;
+    }
+#endif
+    return (uint32_t)CONFIG_CLOUD_IDLE_EXIT_TIMEOUT_MS;
+}
+
 #define WAKEUP_AUDIO_MIX2CH_STREAM_CH_INDEX (0)
 #define WAKEUP_AUDIO_MIX2CH_STREAM_CH_CNAME "stream.mix2ch"
 #define WAKEUP_AUDIO_OUT_STREAM_CH_INDEX (1)
 #define WAKEUP_AUDIO_OUT_STREAM_CH_CNAME "stream.tocloud"
 #define WAKEUP_AUDIO_OUT_STREAM    (1)
 #define WAKEUP_AUDIO_OUT_STREAM_KICK_AUTO   (1)
+
+/* 唤醒防抖：过滤同一次唤醒的重复回调，不用于限制正常连续唤醒 */
+#define WAKEUP_KEYWORD_PUB_MIN_INTERVAL_MS  200
 
 typedef struct {
     short mic1;
@@ -96,65 +178,50 @@ static mic_ref_in_t *mic_ref_in = NULL;
 static const uint8_t echo_zero[CONFIG_AUDIO_STEP_SAMPS * sizeof(ref_in_t)] = {0};
 static SemaphoreHandle_t rx_sem;
 
-__attribute__((weak)) bool is_wakeup_keyword(char *keyword)
-{
-    return false;
-}
-
-/** 是否为数字 */
-static bool is_digit(char str) { return (str >= '0' && str <= '9'); }
-
-/** 是否为特殊字符 */
-static bool is_special(char str) { return (str == '\r'); }
-
-/**
- * 移除字符串中的数字
- * @param input     待处理字符串
- * @return          处理后的字符串
- */
-static char* __remove_digits_and_special(char* input)
-{
-    char* dest = input;
-    char* src = input;
-
-    while(*src) {
-        if(is_digit(*src) || is_special(*src)) { src++; continue; }
-        *dest++ = *src++;
-    }
-    *dest = '\0';
-    return input;
-}
-
-static int app_algo_keyword_and_kid_extract(const uint8_t *const in, uint8_t *out, int max_len)
+static int app_algo_command_extract(const uint8_t *const in, uint8_t *text, int max_len, bool *is_wakeup_keyword)
 {
 	int ret = -1;
-	if (in && out) {
+	if (in && text && is_wakeup_keyword) {
 		cJSON *root = cJSON_Parse(in);
 		if (root) {
+            /* Runtime transport error from new AP; old result JSON remains valid. */
+            cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
+            if (cJSON_IsString(error) && strcmp(error->valuestring, "audio_frame_mismatch") == 0) {
+                cJSON_Delete(root);
+                return -EPROTO;
+            }
 			cJSON *rlt_json = cJSON_GetObjectItem(root, "rlt");
 			if (rlt_json) {
 				if (cJSON_GetArraySize(rlt_json) > 0) {
 					cJSON *rlt0_json = cJSON_GetArrayItem(rlt_json, 0);
 					if (rlt0_json) {
-						cJSON *key_json = cJSON_GetObjectItem(rlt0_json, "keyword");
 						cJSON *kid_json = cJSON_GetObjectItem(rlt0_json, "iresid");
-						cJSON *threshlod_json = cJSON_GetObjectItem(rlt0_json, "ncm");
+                        cJSON *bmain_json = cJSON_GetObjectItem(rlt0_json, "bMain");
                         cJSON *intent_json = cJSON_GetObjectItem(rlt0_json, "intent");
+                        const char *intent_text = NULL;
                         /*兼容旧的版本协议*/
-                        if(intent_json == NULL){
+                        if (intent_json == NULL) {
                             intent_json = cJSON_GetObjectItem(rlt0_json, "intentStr");
                         }
-						if (key_json && threshlod_json && intent_json) {
-							char *proc_keyword = __remove_digits_and_special(intent_json->valuestring);
-							if (proc_keyword) {
-								ret = 0;
-								const int kw_len = strlen(proc_keyword);
-								if (kw_len < max_len) {
-									memcpy(out, proc_keyword, kw_len + 1);
-								} else {
-									strncpy(out, proc_keyword, max_len);
-								}
-							}
+
+                        if (intent_json && cJSON_IsString(intent_json)) {
+                            intent_text = intent_json->valuestring;
+                        } else {
+                            cJSON *keyword_json = cJSON_GetObjectItem(rlt0_json, "keyword");
+                            if (keyword_json && cJSON_IsString(keyword_json)) {
+                                intent_text = keyword_json->valuestring;
+                            }
+                        }
+
+						if (intent_text != NULL) {
+                            snprintf((char *)text, max_len, "%s", intent_text);
+                            if (cJSON_IsBool(bmain_json) || cJSON_IsNumber(bmain_json)) {
+                                *is_wakeup_keyword = (bmain_json->valueint == 1);
+                                ret = 0;
+                            } else if (cJSON_IsNumber(kid_json)) {
+                                *is_wakeup_keyword = (kid_json->valueint == 0);
+                                ret = 0;
+                            }
 						}
 					}
 				}
@@ -169,17 +236,66 @@ static int app_algo_keyword_and_kid_extract(const uint8_t *const in, uint8_t *ou
 static void wakeup_event_handler(uint32_t event, void *event_data, uint32_t event_data_len, void *priv)
 {
     uint8_t keyword[64] = {0};
+    bool is_wakeup_keyword = false;
     int ret;
 
+    /* Continue draining stream notifications, but ignore stale engine events. */
+    if (wakeup_runtime_failed() && !(event & WAKEUP_CB_EVENT_STREAM_UPDATE)) {
+        return;
+    }
     if (event & WAKEUP_CB_EVENT_ENGINE_RLT) {
         LISA_LOGI(TAG, "wakeup result:%d,%s", event_data_len, (char *)event_data);
-        ret = app_algo_keyword_and_kid_extract(event_data, keyword, sizeof(keyword) - 1);
-        if (ret == 0) {
-            if(is_wakeup_keyword(keyword)){
-                voice_msg_pub(VOICE_MSG_WAKEUP_KEYWORD, keyword, strlen(keyword) + 1);
+        ret = app_algo_command_extract(event_data, keyword, sizeof(keyword), &is_wakeup_keyword);
+        if (ret == -EPROTO) {
+            /* No synchronous IPC or deinit here: AP may be awaiting our reply,
+             * and audio tasks can still hold stream buffers. Keep handles alive.
+             * The async message lets the voice task stop an already active
+             * cloud session without doing IPC from the AP callback. */
+            if (__atomic_exchange_n(&s_wakeup_runtime_failed, 1U, __ATOMIC_ACQ_REL) == 0U) {
+                int notify_ret = voice_msg_pub(VOICE_MSG_CLOUD_SESSION_INTERRUPT, NULL, 0);
+                if (notify_ret != 0) {
+                    LISA_LOGW(TAG, "failed to notify cloud session of runtime mismatch: %d", notify_ret);
+                }
             }
-            else{
-                voice_msg_pub(VOICE_MSG_WAKEUP_COMMAND, keyword, strlen(keyword) + 1);
+            LISA_LOGW(TAG, "Repeated AP frame mismatch; use CP microphone until reboot");
+            return;
+        }
+        if (ret == 0) {
+            if (is_wakeup_keyword) {
+                TickType_t now = xTaskGetTickCount();
+                if (now - s_last_wakeup_keyword_tick >= pdMS_TO_TICKS(WAKEUP_KEYWORD_PUB_MIN_INTERVAL_MS)) {
+#ifdef CONFIG_BOARD_ARCS_MINI
+                    app_wakeup_audio_diag_begin_wake();
+                    /*
+                     * Restore playback before publishing the wake event. The wake tone is a
+                     * direct subscriber and may start before the UI processes its activity
+                     * callback.
+                     */
+                    int power_ret = app_wakeup_audio_standby_resume();
+                    if (power_ret != 0) {
+                        LISA_LOGW(TAG, "Audio standby resume before wake event failed: %d", power_ret);
+                    }
+#if CONFIG_WIFI
+                    /*
+                     * Standby may skip up to 19 DTIM periods. A local wake is
+                     * an outbound event, so wake the radio before subscribers
+                     * start the cloud interaction.
+                     */
+                    power_ret = sys_wifi_set_standby_power_save(false);
+                    if (power_ret != 0) {
+                        LISA_LOGW(TAG, "WiFi standby resume before wake event failed: %d", power_ret);
+                    }
+#endif
+#endif
+                    s_last_wakeup_keyword_tick = now;
+                    voice_msg_pub(VOICE_MSG_WAKEUP_KEYWORD, keyword, strlen((char *)keyword) + 1);
+                } else {
+                    LISA_LOGD(TAG, "wakeup keyword throttled, last:%u now:%u",
+                              (unsigned int)s_last_wakeup_keyword_tick, (unsigned int)now);
+                }
+            }
+            else {
+                voice_msg_pub(VOICE_MSG_WAKEUP_COMMAND, keyword, strlen((char *)keyword) + 1);
             }
         }
     } else if (event & WAKEUP_CB_EVENT_STREAM_UPDATE) {
@@ -265,16 +381,71 @@ static void audio_stream_callback(const lisa_audio_event_t *event, void *user_da
     uint16_t desc_idx;
     ref_in_t *algo_ref_data = NULL;
 
+    /* When the wakeword engine is unavailable, keep the microphone usable for
+     * button-triggered cloud sessions by forwarding MIC0 directly. */
+    if (wakeup_runtime_failed() || (!s_wakeup_feed_enabled && !s_wakeup_available)) {
+        if (event == NULL || event->record_buffer == NULL || event->record_samples == 0) {
+            return;
+        }
+
+        mic_in_t *adc_data = (mic_in_t *)event->record_buffer;
+        uint32_t sample_count = event->record_samples;
+        if (sample_count > BUFFER_SAMPLES) {
+            sample_count = BUFFER_SAMPLES;
+        }
+
+        int16_t pcm[BUFFER_SAMPLES];
+        for (uint32_t i = 0; i < sample_count; i++) {
+            pcm[i] = adc_data[i].mic1;
+        }
+
+#ifdef CONFIG_BOARD_ARCS_MINI
+        s_audio_diag.record_events_since_wake++;
+        s_audio_diag.mic_bypass_frames_since_wake++;
+#endif
+        bool uploading = voice_cloud_is_uploading_audio();
+        int send_ret = voice_cloud_chat_send_audio((uint8_t *)pcm,
+                                                   (int)(sample_count * sizeof(pcm[0])));
+#ifdef CONFIG_BOARD_ARCS_MINI
+        if (uploading) {
+            uint32_t peak = 0U;
+            for (uint32_t i = 0; i < sample_count; i++) {
+                int32_t sample = pcm[i];
+                uint32_t magnitude = (uint32_t)(sample < 0 ? -sample : sample);
+                if (magnitude > peak) {
+                    peak = magnitude;
+                }
+            }
+            s_audio_diag.cloud_frames_since_wake++;
+            s_audio_diag.last_cloud_peak = peak;
+            if (peak > 0U) {
+                s_audio_diag.cloud_non_silent_frames_since_wake++;
+            }
+            if (send_ret != 0) {
+                s_audio_diag.cloud_send_failures_since_wake++;
+            }
+        }
+#else
+        (void)uploading;
+        (void)send_ret;
+#endif
+        return;
+    }
+
+    if (!s_wakeup_feed_enabled) {
+        return;
+    }
+
     bool has_record = (event->record_buffer != NULL && event->record_samples > 0);
     if (!has_record) {
         LISA_LOGE(LOG_TAG, "Invalid audio event: record=0");
         return;
     }
 
-#if CONFIG_APP_USB_AUDIO_ENABLE
-    wakeup_stream_debug_data_input(event->record_buffer, event->echo_buffer, event->record_samples,
-                                   event->echo_samples);
+#ifdef CONFIG_BOARD_ARCS_MINI
+    s_audio_diag.record_events_since_wake++;
 #endif
+
 
 #if CONFIG_ACOMP_WAKEUP_ALGORITHM_TYPE_DUAL_MIC
     algo_ref_data = (ref_in_t*)event->echo_buffer;
@@ -295,6 +466,9 @@ static void audio_stream_callback(const lisa_audio_event_t *event, void *user_da
         acomp_wakeup_stream_tx_buffer_submit(WAKEUP_AUDIO_MIX2CH_STREAM_CH_INDEX, buffer, buf_size, desc_idx);
     } else {
         LOGE("acomp_wakeup_stream_tx_buffer_alloc failed");
+#ifdef CONFIG_BOARD_ARCS_MINI
+        s_audio_diag.input_submit_failures_since_wake++;
+#endif
     }
 }
 
@@ -395,6 +569,202 @@ static int start_playback(lisa_device_t *audio_dev)
     return LISA_DEVICE_OK;
 }
 
+#ifdef CONFIG_BOARD_ARCS_MINI
+int app_wakeup_audio_standby_suspend(void)
+{
+    int ret = 0;
+    int step_ret;
+
+    if (!s_audio_inited || g_audio_dev == NULL || s_audio_power_mutex == NULL) {
+        return -1;
+    }
+
+    xSemaphoreTake(s_audio_power_mutex, portMAX_DELAY);
+
+    if (app_wakeup_audio_standby_active()) {
+        xSemaphoreGive(s_audio_power_mutex);
+        return 0;
+    }
+
+    s_audio_diag.suspend_count++;
+
+    step_ret = lisa_audio_play_stop(g_audio_dev);
+    if (step_ret != LISA_DEVICE_OK) {
+        LISA_LOGW(TAG, "Standby play stop failed: %d", step_ret);
+        ret = step_ret;
+    } else {
+        s_audio_playback_off = true;
+    }
+
+    step_ret = DAC_PowerControl(DAC01(), CSK_POWER_OFF);
+    if (step_ret != CSK_DRIVER_OK) {
+        LISA_LOGW(TAG, "Standby DAC power off failed: %d", step_ret);
+        if (ret == 0) {
+            ret = step_ret;
+        }
+    } else {
+        s_audio_playback_off = true;
+    }
+
+    /*
+     * The single-mic wake path consumes MIC0 (left). MIC1 (right) is only the
+     * hard AEC reference and has no useful signal while playback is off.
+     * Keep its DMA slot alive but power down its ADC/PGA/VREF.
+     */
+    step_ret = ADC_PDM_AnalogChannelPowerControl(ADC_PDM01(),
+                                                 ADC_PDM_BMP_RIGHT,
+                                                 CSK_POWER_OFF);
+    if (step_ret != CSK_DRIVER_OK) {
+        LISA_LOGW(TAG, "Standby reference ADC power off failed: %d", step_ret);
+        if (ret == 0) {
+            ret = step_ret;
+        }
+    } else {
+        s_audio_reference_channel_off = true;
+    }
+
+    /*
+     * CSK_POWER_LOW only changes ADC/PGA bias settings. Recording, DMA and
+     * wake-word processing remain active.
+     */
+    step_ret = ADC_PDM_PowerControl(ADC_PDM01(), CSK_POWER_LOW);
+    if (step_ret != CSK_DRIVER_OK) {
+        LISA_LOGW(TAG, "Standby ADC low-power request failed: %d", step_ret);
+        if (ret == 0) {
+            ret = step_ret;
+        }
+    } else {
+        s_audio_adc_low_power = true;
+    }
+
+    app_wakeup_audio_diag_sync_state();
+    xSemaphoreGive(s_audio_power_mutex);
+
+    LISA_LOGI(TAG, "Audio standby active: DAC/DMA stopped, ADC low-power bias, recording kept");
+    return ret;
+}
+
+int app_wakeup_audio_standby_resume(void)
+{
+    int ret = 0;
+    int step_ret;
+    bool record_restored = false;
+
+    if (!s_audio_inited || g_audio_dev == NULL || s_audio_power_mutex == NULL) {
+        return 0;
+    }
+
+    LISA_LOGI(TAG, "Audio standby resume: mutex wait");
+    xSemaphoreTake(s_audio_power_mutex, portMAX_DELAY);
+    LISA_LOGI(TAG,
+              "Audio standby resume: mutex acquired, adc_low=%u ref_off=%u play_off=%u",
+              (unsigned int)s_audio_adc_low_power,
+              (unsigned int)s_audio_reference_channel_off,
+              (unsigned int)s_audio_playback_off);
+
+    if (!app_wakeup_audio_standby_active()) {
+        xSemaphoreGive(s_audio_power_mutex);
+        return 0;
+    }
+
+    s_audio_diag.resume_count++;
+
+    if (s_audio_adc_low_power) {
+        LISA_LOGI(TAG, "Audio standby resume: ADC bias begin");
+        step_ret = ADC_PDM_PowerControl(ADC_PDM01(), CSK_POWER_FULL);
+        LISA_LOGI(TAG, "Audio standby resume: ADC bias end ret=%d", step_ret);
+        if (step_ret != CSK_DRIVER_OK) {
+            LISA_LOGW(TAG, "ADC full-power restore failed: %d", step_ret);
+            ret = step_ret;
+        } else {
+            s_audio_adc_low_power = false;
+        }
+    }
+
+    if (s_audio_reference_channel_off) {
+        LISA_LOGI(TAG, "Audio standby resume: reference ADC begin");
+        step_ret = ADC_PDM_AnalogChannelPowerControl(ADC_PDM01(),
+                                                     ADC_PDM_BMP_RIGHT,
+                                                     CSK_POWER_FULL);
+        LISA_LOGI(TAG, "Audio standby resume: reference ADC end ret=%d", step_ret);
+        if (step_ret != CSK_DRIVER_OK) {
+            LISA_LOGW(TAG, "Reference ADC full-power restore failed: %d", step_ret);
+            if (ret == 0) {
+                ret = step_ret;
+            }
+        } else {
+            lisa_audio_record_channel_gain_t gain = {
+                .left = {
+                    .analog_gain = g_record_mic_analog_gain,
+                    .digital_gain = g_record_mic_digital_gain,
+                },
+                .right = {
+                    .analog_gain = g_record_ref_analog_gain,
+                    .digital_gain = g_record_ref_digital_gain,
+                },
+            };
+
+            step_ret = lisa_audio_record_set_channel_gain(g_audio_dev, &gain);
+            if (step_ret != LISA_DEVICE_OK) {
+                LISA_LOGW(TAG, "Record gain restore failed: %d", step_ret);
+                if (ret == 0) {
+                    ret = step_ret;
+                }
+            } else {
+                s_audio_reference_channel_off = false;
+            }
+        }
+    }
+
+    record_restored = !s_audio_adc_low_power &&
+                      !s_audio_reference_channel_off;
+    if (record_restored) {
+        vTaskDelay(pdMS_TO_TICKS(AUDIO_STANDBY_RECORD_WARMUP_MS));
+    }
+
+    /*
+     * DAC power-off clears the HAL configured flag, so perform the complete
+     * LISA configure/start sequence rather than only issuing PLAY_START.
+     */
+    if (s_audio_playback_off) {
+        LISA_LOGI(TAG, "Audio standby resume: playback rebuild begin");
+        step_ret = start_playback(g_audio_dev);
+        LISA_LOGI(TAG, "Audio standby resume: playback rebuild end ret=%d", step_ret);
+        if (step_ret != LISA_DEVICE_OK) {
+            LISA_LOGE(TAG, "Playback rebuild after standby failed: %d", step_ret);
+            if (ret == 0) {
+                ret = step_ret;
+            }
+        } else {
+            s_audio_playback_off = false;
+            /*
+             * start_playback() starts the DAC with two silent DMA buffers. Let
+             * the output path settle before the short wake tone is queued.
+             */
+            vTaskDelay(pdMS_TO_TICKS(AUDIO_STANDBY_PLAYBACK_WARMUP_MS));
+        }
+    }
+
+    app_wakeup_audio_diag_sync_state();
+    if (app_wakeup_audio_standby_active()) {
+        s_audio_diag.resume_failures++;
+        if (ret == 0) {
+            ret = -1;
+        }
+        LISA_LOGW(TAG,
+                  "Audio standby resume incomplete: adc_low=%u ref_off=%u play_off=%u ret=%d",
+                  (unsigned int)s_audio_adc_low_power,
+                  (unsigned int)s_audio_reference_channel_off,
+                  (unsigned int)s_audio_playback_off, ret);
+    } else {
+        LISA_LOGI(TAG, "Audio standby exited: ADC and playback restored");
+    }
+
+    xSemaphoreGive(s_audio_power_mutex);
+    return ret;
+}
+#endif
+
 static int audio_init(void)
 {
     int ret;
@@ -403,6 +773,16 @@ static int audio_init(void)
     if (s_audio_inited) {
         return 0;
     }
+
+#ifdef CONFIG_BOARD_ARCS_MINI
+    if (s_audio_power_mutex == NULL) {
+        s_audio_power_mutex = xSemaphoreCreateMutex();
+        if (s_audio_power_mutex == NULL) {
+            LISA_LOGE(TAG, "Failed to create audio power mutex");
+            return -1;
+        }
+    }
+#endif
 
     LISA_LOGI(TAG, "Fused format: 4-channel (mic0, mic1, ref0, ref1)");
 
@@ -545,25 +925,43 @@ static void wakeup_out_stream_to_cloud(uint8_t *data, int len)
 #define LS_RECORD_ONE_CHNNEL_SIZE (UAS_REC_FRM_SAMPS * sizeof(short))
 
     for (int j = 0; j < len / (LS_RECORD_ONE_CHNNEL_SIZE * UAS_REC_CHANNELS); j++) {
-        short rec_buf[UAS_REC_FRM_SAMPS] = {0};
-        short(*uac_rec)[UAS_REC_CHANNELS] =
+        short algo_out[UAS_REC_FRM_SAMPS] = {0};
+        uint32_t peak = 0U;
+        short(*algo_frame)[UAS_REC_CHANNELS] =
             (short(*)[UAS_REC_CHANNELS])((uint8_t *)data + LS_RECORD_ONE_CHNNEL_SIZE * UAS_REC_CHANNELS * j);
         for (int i = 0; i < UAS_REC_FRM_SAMPS; i++) {
-            rec_buf[i] = uac_rec[i][3];
+            algo_out[i] = algo_frame[i][3];
         }
 
         /* Apply +6dB gain (x2) to clean audio before sending to cloud ASR */
         for (int i = 0; i < UAS_REC_FRM_SAMPS; i++) {
-            int32_t sample = (int32_t)rec_buf[i] << 1;
+            int32_t sample = (int32_t)algo_out[i] << 1;
             if (sample > SHRT_MAX) {
                 sample = SHRT_MAX;
             } else if (sample < SHRT_MIN) {
                 sample = SHRT_MIN;
             }
-            rec_buf[i] = (short)sample;
+            if (sample > -CONFIG_LSCHAT_WAKEUP_CLOUD_NOISE_GATE_THRESHOLD &&
+                sample < CONFIG_LSCHAT_WAKEUP_CLOUD_NOISE_GATE_THRESHOLD) {
+                sample = 0;
+            }
+            algo_frame[i][4] = (short)sample; // 保存上报云端的数据，后续UAC传出
+            algo_out[i] = (short)sample;
+            uint32_t magnitude = (uint32_t)(sample < 0 ? -sample : sample);
+            if (magnitude > peak) {
+                peak = magnitude;
+            }
         }
 
-        voice_cloud_chat_send_audio((uint8_t *)rec_buf, LS_RECORD_ONE_CHNNEL_SIZE);
+        s_audio_diag.cloud_frames_since_wake++;
+        s_audio_diag.last_cloud_peak = peak;
+        if (peak > 0U) {
+            s_audio_diag.cloud_non_silent_frames_since_wake++;
+        }
+        if (voice_cloud_chat_send_audio((uint8_t *)algo_out,
+                                        LS_RECORD_ONE_CHNNEL_SIZE) != 0) {
+            s_audio_diag.cloud_send_failures_since_wake++;
+        }
     }
 }
 
@@ -590,9 +988,12 @@ static void wakeup_out_task(void *pvParameters)
 
                 LISA_LOGD(TAG, "acomp_wakeup_stream_rx_buffer_get ok");
 
-                wakeup_out_stream_to_cloud(buffer, len);
-
-                wakeup_stream_debug_data_output(buffer, len);
+                s_audio_diag.output_buffers_since_wake++;
+                s_audio_diag.output_bytes_since_wake += len;
+                if (!wakeup_runtime_failed()) {
+                    wakeup_out_stream_to_cloud(buffer, len);
+                    wakeup_stream_debug_data_output(buffer, len);
+                }
 
                 /* 释放缓冲区 */
                 ret = acomp_wakeup_stream_rx_buffer_release(WAKEUP_AUDIO_OUT_STREAM_CH_INDEX, desc_idx, len, buffer);
@@ -614,16 +1015,30 @@ int app_wakeup_init(struct wakeup_algo_resources *algo_res)
     int ret = 0;
     bool wakeup_res_valid = false;
 
+    s_wakeup_available = false;
+    __atomic_store_n(&s_wakeup_runtime_failed, 0U, __ATOMIC_RELEASE);
+
     ret = audio_init();
     if (ret != 0) {
         LISA_LOGE(TAG, "Audio init failed: %d", ret);
         return ret;
     }
 
+    if (!s_audio_callback_registered) {
+        ret = lisa_audio_register_callback(g_audio_dev, audio_stream_callback, NULL);
+        if (ret != LISA_DEVICE_OK) {
+            LISA_LOGE(TAG, "Failed to register audio callback: %d", ret);
+            return ret;
+        }
+        s_audio_callback_registered = true;
+        LISA_LOGI(TAG, "Audio callback registered");
+    }
+
     wakeup_res_valid = (algo_res != NULL && algo_res->mlp.addr != NULL && algo_res->mlp.size > 0 &&
                         algo_res->wrap.addr != NULL && algo_res->wrap.size > 0);
     if (!wakeup_res_valid) {
         LISA_LOGW(TAG, "Wakeup resources invalid, skip wakeup engine init");
+        s_wakeup_feed_enabled = false;
 #if CONFIG_BOARD_ARCS_MINI
         s_wakeup_started = false;
 #endif
@@ -662,48 +1077,76 @@ int app_wakeup_init(struct wakeup_algo_resources *algo_res)
     }
 #endif
 #endif
-    acomp_wakeup_init();
-    acomp_wakeup_add_callback(    WAKEUP_CB_EVENT_ENGINE_RLT 
-                                | WAKEUP_CB_EVENT_STREAM_UPDATE 
-                                | WAKEUP_CB_EVENT_ENGINE_TIMEOUT 
-                                | WAKEUP_CB_EVENT_ENGINE_ANGLE
-                                | WAKEUP_CB_EVENT_ENGINE_SWITCH_MODE,
-                           wakeup_event_handler, NULL);
-
-    acomp_ipc_prepare_t *prepare;
-    uint32_t size;
-
-    size = sizeof(acomp_ipc_prepare_t) + sizeof(acomp_res_item_t) * ACOMP_WAKEUP_RES_NUMBER;
-    size = ALIGN_SIZE(size);
-
-    prepare = psram_malloc_align(IPC_ALIGN_SIZE, size);
-    if (prepare == NULL) {
-        LOGE("prepare mem alloc failed");
-        return -1;
+    ret = acomp_wakeup_init();
+    if (ret != ACOMP_ERR_OK) {
+        LISA_LOGE(TAG, "acomp_wakeup_init failed: %d", ret);
+        goto wakeup_init_failed;
     }
 
-    prepare->number = ACOMP_WAKEUP_RES_NUMBER;
-    prepare->item[0].index = WAKEUP_INDEX_CAE_ESR_MLP;
-    prepare->item[0].addr = algo_res->mlp.addr;
-    prepare->item[0].offset = 0;
-    prepare->item[0].size = algo_res->mlp.size;
+    /* Compatibility is determined by prepare/start, not firmware identities.
+     * In particular, legacy APs can still use their matching resources. */
+    ret = acomp_wakeup_add_callback(WAKEUP_CB_EVENT_ENGINE_RLT
+                                    | WAKEUP_CB_EVENT_STREAM_UPDATE
+                                    | WAKEUP_CB_EVENT_ENGINE_TIMEOUT
+                                    | WAKEUP_CB_EVENT_ENGINE_ANGLE
+                                    | WAKEUP_CB_EVENT_ENGINE_SWITCH_MODE,
+                                    wakeup_event_handler, NULL);
+    if (ret != ACOMP_ERR_OK) {
+        LISA_LOGE(TAG, "acomp_wakeup_add_callback failed: %d", ret);
+        goto wakeup_init_failed;
+    }
 
-    prepare->item[1].index = WAKEUP_INDEX_AI_WRAP;
-    prepare->item[1].addr = algo_res->wrap.addr;
-    prepare->item[1].offset = 0;
-    prepare->item[1].size = algo_res->wrap.size;
+    const acomp_wakeup_resource_config_t wakeup_config = {
+        .mlp = {
+            .storage = ACOMP_WAKEUP_RES_STORAGE_FLASH,
+            .addr = (uintptr_t)algo_res->mlp.addr,
+            .size = algo_res->mlp.size,
+        },
+        .wrap = {
+            .storage = ACOMP_WAKEUP_RES_STORAGE_FLASH,
+            .addr = (uintptr_t)algo_res->wrap.addr,
+            .size = algo_res->wrap.size,
+        },
+    };
 
-    ret = acomp_wakeup_prepare_with_config(prepare);
+    ret = acomp_wakeup_prepare_with_resources(&wakeup_config);
     LISA_LOGI(TAG, "acomp_wakeup_prepare ret:%d", ret);
+    if (ret != ACOMP_ERR_OK) {
+        goto wakeup_init_failed;
+    }
+
     ret = acomp_wakeup_start();
     LISA_LOGI(TAG, "acomp_wakeup_start ret:%d", ret);
+    if (ret != ACOMP_ERR_OK) {
+        goto wakeup_init_failed;
+    }
 
     ret = acomp_wakeup_set_algo_mode(ACOMP_WAKEUP_ALGO_MODE_WAKEUP);
     LISA_LOGI(TAG, "acomp_wakeup_set_algo_mode ret:%d", ret);
+    if (ret != ACOMP_ERR_OK) {
+        goto wakeup_started_failed;
+    }
 
-    acomp_wakeup_stream_ch_enable(WAKEUP_AUDIO_MIX2CH_STREAM_CH_INDEX,&desc);
+    // TODO: arcs-mini 2.6版本使用
+    // ret = acomp_wakeup_set_timeout(app_wakeup_get_esr_timeout_ms()); 
+    ret = acomp_wakeup_set_timeout(0);
+    LISA_LOGI(TAG, "acomp_wakeup_set_timeout ret:%d\r\n", ret);
+    if (ret != ACOMP_ERR_OK) {
+        goto wakeup_started_failed;
+    }
+
+    ret = acomp_wakeup_stream_ch_enable(WAKEUP_AUDIO_MIX2CH_STREAM_CH_INDEX, &desc);
+    if (ret != ACOMP_ERR_OK) {
+        LISA_LOGE(TAG, "Failed to enable wakeup input stream: %d", ret);
+        goto wakeup_started_failed;
+    }
 #if WAKEUP_AUDIO_OUT_STREAM
-    acomp_wakeup_stream_ch_enable(WAKEUP_AUDIO_OUT_STREAM_CH_INDEX,&rx_desc);
+    ret = acomp_wakeup_stream_ch_enable(WAKEUP_AUDIO_OUT_STREAM_CH_INDEX, &rx_desc);
+    if (ret != ACOMP_ERR_OK) {
+        LISA_LOGE(TAG, "Failed to enable wakeup output stream: %d", ret);
+        (void)acomp_wakeup_stream_ch_disable(WAKEUP_AUDIO_MIX2CH_STREAM_CH_INDEX);
+        goto wakeup_started_failed;
+    }
 #endif
     mic_ref_in = (mic_ref_in_t *)psram_malloc(sizeof(mic_ref_in_t) * CONFIG_AUDIO_STEP_SAMPS);
     if(mic_ref_in == NULL)
@@ -725,24 +1168,36 @@ int app_wakeup_init(struct wakeup_algo_resources *algo_res)
     }
     LISA_LOGI(TAG, "Audio device acquired");
  
-    /* Register unified callback */
-    ret = lisa_audio_register_callback(audio_dev, audio_stream_callback, NULL);
-    if (ret != LISA_DEVICE_OK) {
-        LISA_LOGE(TAG, "Failed to register callback: %d", ret);
-        return -1;
-    }
-    LISA_LOGI(TAG, "Audio callback registered");
-
     if (!audio_dev) {
         LISA_LOGE(TAG, "Failed to initialize audio device");
         return -1;
     }
 
+    s_wakeup_feed_enabled = true;
+
 #if CONFIG_BOARD_ARCS_MINI
     s_wakeup_started = true;
 #endif
+    s_wakeup_available = true;
 
     return ret;
+
+wakeup_started_failed:
+    (void)acomp_wakeup_stop();
+wakeup_init_failed:
+    s_wakeup_feed_enabled = false;
+#if CONFIG_BOARD_ARCS_MINI
+    s_wakeup_started = false;
+#endif
+    (void)acomp_wakeup_deinit();
+    s_wakeup_available = false;
+    LISA_LOGW(TAG, "Wakeup initialization failed (%d); CP microphone bypass enabled", ret);
+    return ret;
+}
+
+bool app_wakeup_is_available(void)
+{
+    return s_wakeup_available && !wakeup_runtime_failed();
 }
 
 #ifdef CONFIG_BOARD_ARCS_MINI
@@ -751,27 +1206,37 @@ int app_wakeup_stop(void)
     if (!s_wakeup_started) {
         return 0;
     }
-    
-    acomp_wakeup_stop();
+
+    s_wakeup_feed_enabled = false;
+
+    (void)acomp_wakeup_stream_ch_disable(WAKEUP_AUDIO_MIX2CH_STREAM_CH_INDEX);
+#if WAKEUP_AUDIO_OUT_STREAM
+    (void)acomp_wakeup_stream_ch_disable(WAKEUP_AUDIO_OUT_STREAM_CH_INDEX);
+#endif
+    (void)acomp_wakeup_stop();
     s_wakeup_started = false;
 
     return 0;
 }
 #endif
 
-int app_wakeup_sensitivity_level_set(app_wakeup_sensitivity_level_e level){
-
-    static const int level_remap[] = {
+int app_wakeup_sensitivity_level_set(app_wakeup_sensitivity_level_e level)
+{
+    static const acomp_wakeup_threshold_level_e level_remap[] = {
         [APP_WAKEUP_SENSITIVITY_LEVEL_0] = ACOMP_WAKEUP_THRESHOLD_LEVEL_1,
-        [APP_WAKEUP_SENSITIVITY_LEVEL_1] = ACOMP_WAKEUP_THRESHOLD_LEVEL_2,
-        [APP_WAKEUP_SENSITIVITY_LEVEL_2] = ACOMP_WAKEUP_THRESHOLD_LEVEL_3,
-        [APP_WAKEUP_SENSITIVITY_LEVEL_3] = ACOMP_WAKEUP_THRESHOLD_LEVEL_4,
-        [APP_WAKEUP_SENSITIVITY_LEVEL_4] = ACOMP_WAKEUP_THRESHOLD_LEVEL_5,
+        [APP_WAKEUP_SENSITIVITY_LEVEL_1] = ACOMP_WAKEUP_THRESHOLD_LEVEL_1,
+        [APP_WAKEUP_SENSITIVITY_LEVEL_2] = ACOMP_WAKEUP_THRESHOLD_LEVEL_2,
+        [APP_WAKEUP_SENSITIVITY_LEVEL_3] = ACOMP_WAKEUP_THRESHOLD_LEVEL_3,
+        [APP_WAKEUP_SENSITIVITY_LEVEL_4] = ACOMP_WAKEUP_THRESHOLD_LEVEL_3,
     };
-    
+
+    if (level < APP_WAKEUP_SENSITIVITY_LEVEL_0 || level > APP_WAKEUP_SENSITIVITY_LEVEL_4) {
+        return -1;
+    }
+
     s_sensitivity_level = level;
-    acomp_wakeup_set_threshold(level_remap[level]);
-    LISA_LOGI(TAG,"app_wakeup_sensitivity_level_set %d",level);
+    LISA_LOGI(TAG, "app_wakeup_sensitivity_level_set %d", level);
+    return acomp_wakeup_set_threshold(level_remap[level]);
 }
 
 app_wakeup_sensitivity_level_e app_wakeup_sensitivity_level_get(void){
@@ -796,6 +1261,11 @@ static int shell_algo_restart(int argc, char **argv)
 
         ret = acomp_wakeup_set_algo_mode(ACOMP_WAKEUP_ALGO_MODE_WAKEUP);
         shellPrint(shell, "acomp_wakeup_set_algo_mode ret:%d\r\n", ret);
+
+        // TODO: arcs-mini 2.6版本使用
+        // ret = acomp_wakeup_set_timeout(app_wakeup_get_esr_timeout_ms()); 
+        ret = acomp_wakeup_set_timeout(0);
+        shellPrint(shell, "acomp_wakeup_set_timeout ret:%d\r\n", ret);
     } else {
         shellPrint(shell, "algo restart error\r\n");
     }

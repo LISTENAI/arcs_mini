@@ -243,7 +243,7 @@ ASSERT  ((_wifi_ram_end <= (0x20000000 + 256 * 1024)), "error: wifi ram end must
         . = ALIGN(4);
         * (.fast_bss .fast_bss.*)
         *heap.a: (.bss .bss.*)
-        . = ALIGN(4); 
+        . = ALIGN(4);
     } >RAM AT>RAM
 
     ////////////////////////////////////////////////////////////////////////////
@@ -513,4 +513,38 @@ ASSERT  ((_wifi_ram_end <= (0x20000000 + 256 * 1024)), "error: wifi ram end must
         PROVIDE(__StackTop = .);
         PROVIDE(_estack = .);
     } >RAM AT>RAM
+
+    /*
+     * Non-allocatable toolchain metadata is intentionally listed so
+     * --orphan-handling=error only catches real missing runtime sections.
+     */
+    .riscv.attributes 0 : { KEEP(*(.riscv.attributes)) }
+    .comment 0 : { *(.comment .comment.*) }
+    .note.GNU-stack 0 : { *(.note.GNU-stack) }
+
+    .debug_info 0 : { *(.debug_info .debug_info.* .gnu.linkonce.wi.*) }
+    .debug_abbrev 0 : { *(.debug_abbrev) }
+    .debug_aranges 0 : { *(.debug_aranges) }
+    .debug_ranges 0 : { *(.debug_ranges) }
+    .debug_rnglists 0 : { *(.debug_rnglists .debug_rnglists.*) }
+    .debug_line 0 : { *(.debug_line .debug_line.*) }
+    .debug_line_str 0 : { *(.debug_line_str) }
+    .debug_str 0 : { *(.debug_str .debug_str.*) }
+    .debug_loc 0 : { *(.debug_loc) }
+    .debug_loclists 0 : { *(.debug_loclists .debug_loclists.*) }
+    .debug_frame 0 : { *(.debug_frame) }
+    .debug_macro 0 : { *(.debug_macro .debug_macro.*) }
+    .debug_addr 0 : { *(.debug_addr .debug_addr.*) }
+    .debug_str_offsets 0 : { *(.debug_str_offsets .debug_str_offsets.*) }
+    .debug_pubnames 0 : { *(.debug_pubnames) }
+    .debug_pubtypes 0 : { *(.debug_pubtypes) }
+    .debug_gnu_pubnames 0 : { *(.debug_gnu_pubnames) }
+    .debug_gnu_pubtypes 0 : { *(.debug_gnu_pubtypes) }
+    .debug_names 0 : { *(.debug_names) }
+    .debug_sup 0 : { *(.debug_sup) }
+    .debug_cu_index 0 : { *(.debug_cu_index) }
+    .debug_tu_index 0 : { *(.debug_tu_index) }
+    .debug_other 0 : { *(.debug_*) }
+
+    .relocs 0 : { *(.rel*) *(.rela*) }
 }

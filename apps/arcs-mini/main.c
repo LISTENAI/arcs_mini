@@ -1,9 +1,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
-#include "project_version.h"
 
 #define TAG "main"
-
 #include "lisa_log.h"
 
 #include "service_led.h"
@@ -13,218 +11,286 @@
 #include "service_camera.h"
 #include "service_alarm.h"
 #include "service_image.h"
-#include "alarm_ring.h"
-#include "alarm.h"
-#include "alarm_handler.h"
+#include "service_sd_music.h"
+#include "service_power_policy.h"
 
+#include "app_button.h"
+#include "button_blecfg.h"
 #include "voice_msg.h"
 #include "lisa_kv.h"
-#include "wifi_manager/wifi_manager.h"
-#include "app_datas.h"
+#include "sys_network_manager.h"
+#include "sys_wifi.h"
 #include "tone.h"
-#include "app_player.h"
-#include "pa_manager.h"
 #include "voice_player_comm.h"
-#include "power/power_manager.h"
-#include "lisa_display.h"
+#include "voice_player/tone_control/voice_player_network_tone.h"
 #include "battery/battery.h"
-#include "lisa_ui_nav_scr.h"
+#include "apps/llm/models/model_qrcode.h"
 #include "voice_cloud.h"
+#include "miniapp.h"
+#include "app_ble_common.h"
 
-extern uint8_t app_ble_adv_start(uint8_t adv_id, uint8_t adv_type);
+/* 被动网络提示的单次触发状态。 */
+static bool s_netcfg_tone_latched = false;
+static bool s_cloud_ever_connected = false;
+static bool s_bind_prompted_before_first_cloud_ok = false;
+static bool s_runtime_wifi_prompted = false;
+static bool s_boot_probe_fail_prompted = false;
 
-void network_reset(void)
+/* 被动网络异常的展示策略暂留在 main，后续可独立改为 Home 页二维码表情。 */
+static bool app_should_open_info_by_cloud_state(uint32_t *status_out)
 {
-    LOGI("network reset running...");
+    uint32_t status = QR_STATUS_CONNECTED;
+
+    switch (voice_cloud_get_state()) {
+    case VOICE_CLOUD_STATE_CONNECTING:
+        return false;
+    case VOICE_CLOUD_STATE_NO_NETWORK:
+    case VOICE_CLOUD_STATE_NO_INTERNET:
+        status = QR_STATUS_NOT_CONNECTED;
+        break;
+    case VOICE_CLOUD_STATE_TOKEN_FAILED:
+        status = QR_STATUS_AUTH_FAILED;
+        break;
+    case VOICE_CLOUD_STATE_CONNECT_FAILED:
+        status = voice_cloud_is_device_unbound() ? QR_STATUS_BIND : QR_STATUS_NOT_CONNECTED;
+        break;
+    default:
+        return false;
+    }
+
+    if (status_out) {
+        *status_out = status;
+    }
+
+    return true;
+}
+
+#ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
+static void app_show_wifi_emoji(void)
+{
+    static const char wifi_emoji[] = "wifi";
+
+    voice_msg_pub(VOICE_MSG_CLOUD_EMOJI, (void *)wifi_emoji, sizeof(wifi_emoji));
+}
+#endif
+
+static void app_open_cloud_info(uint32_t status)
+{
+    /* Let the foreground miniapp display its own network error and retry.
+     * A passive network notification must not replace its page. */
+    if (miniapp_is_active()) {
+        return;
+    }
 #if CONFIG_WIFI_MANAGER
-    wifi_mgr_sta_disconnect(true);
-    wifi_mgr_sta_config_t list[16] = {0};
-    int count = 0;
-    do {
-        count = wifi_mgr_storage_search_ap(list, (int)(sizeof(list) / sizeof(list[0])), SEARCH_ALL, NULL);
-        if (count > 0) {
-            int del_count = count;
-            if (del_count > (int)(sizeof(list) / sizeof(list[0]))) {
-                del_count = (int)(sizeof(list) / sizeof(list[0]));
-            }
-            for (int i = 0; i < del_count; i++) {
-                wifi_mgr_storage_delete_ap(&list[i]);
-            }
+#ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
+    if (status == QR_STATUS_NOT_CONNECTED) {
+        if (!sys_wifi_has_ap()) {
+            LISA_LOGI(TAG, "No saved WiFi AP, start BLE netcfg on doll_v2");
+            app_ble_netcfg_adv_start_delayed();
         }
-    } while (count > (int)(sizeof(list) / sizeof(list[0])));
+        app_show_wifi_emoji();
+        return;
+    }
+#endif
+    voice_msg_pub(VOICE_MSG_CLOUD_OPEN_INFO, &status, sizeof(status));
+#else
+    (void)status;
 #endif
 }
 
-
-void factory_reset(void)
+static void app_show_initial_wifi_info_if_needed(void)
 {
-    LOGI("factory reset running...");
-    lisa_kv_clear();
-    network_reset();
-    LOGI("factory reset dwone.");
-    LOGI("The system will restart after 300ms.");
-    app_player_play(tone_player, app_tone_get_url(TONE_ID_103));
-    vTaskDelay(2000);
-    extern void sys_platform_sw_full_reset(void);
-    sys_platform_sw_full_reset();
+    sys_network_status_t status = {0};
+    
+    if (sys_network_get_status(&status) == 0 &&
+        status.mode == SYS_NETWORK_MODE_WIFI &&
+        !sys_wifi_has_ap()) {
+        app_open_cloud_info(QR_STATUS_NOT_CONNECTED);
+    }
+}
+
+static bool app_wifi_connect_failed(void)
+{
+    switch (sys_wifi_get_connect_result()) {
+    case SYS_WIFI_CONNECT_RESULT_FAIL_NO_AP:
+    case SYS_WIFI_CONNECT_RESULT_FAIL_PASSWORD:
+    case SYS_WIFI_CONNECT_RESULT_FAIL_IP:
+    case SYS_WIFI_CONNECT_RESULT_FAIL_OTHER:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool app_should_play_netcfg_tone(uint32_t status)
+{
+    if (status != QR_STATUS_NOT_CONNECTED) {
+        return false;
+    }
+
+    /* 无保存 AP 的启动提示由 voice_player_network_tone 负责；main 只补充已保存 AP 的连接失败提示。 */
+    return sys_wifi_has_ap() && app_wifi_connect_failed();
+}
+
+static void app_play_netcfg_tone_once(uint32_t status)
+{
+    if (s_netcfg_tone_latched || !app_should_play_netcfg_tone(status)) {
+        return;
+    }
+
+    voice_player_network_tone_request_netcfg_tone();
+    s_netcfg_tone_latched = true;
 }
 
 static void voice_system_network_probe_success(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
 {
-    // 这里可以初始化需要网络的服务
+    (void)unused;
+    (void)msg_id;
+    (void)data;
+    (void)len;
+    (void)user_data;
+
+    s_netcfg_tone_latched = false;
+    s_boot_probe_fail_prompted = false;
 }
+
+static void voice_cloud_connected(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
+{
+    (void)unused;
+    (void)msg_id;
+    (void)data;
+    (void)len;
+    (void)user_data;
+
+    s_netcfg_tone_latched = false;
+    s_cloud_ever_connected = true;
+    s_bind_prompted_before_first_cloud_ok = false;
+    s_runtime_wifi_prompted = false;
+    s_boot_probe_fail_prompted = false;
+}
+
+static void voice_cloud_auth_failed(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
+{
+    (void)unused;
+    (void)msg_id;
+    (void)data;
+    (void)len;
+    (void)user_data;
+
+    if (button_blecfg_is_user_entered() || s_cloud_ever_connected || s_bind_prompted_before_first_cloud_ok) {
+        return;
+    }
+
+    app_open_cloud_info(QR_STATUS_AUTH_FAILED);
+    s_bind_prompted_before_first_cloud_ok = true;
+}
+
 
 static void voice_cloud_auth_success(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
 {
     service_alarm_init();
+    /* SD state must also be reconciled on modem-only devices. */
+    (void)service_sd_music_init();
 }
 
-static void button_changed(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
+static void voice_wifi_provision_guard(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
 {
-    voice_msg_button_evt_t *evt = (voice_msg_button_evt_t *)data;
+    bool mark_boot_probe_prompted = false;
+    bool user_entered_blecfg = button_blecfg_is_user_entered();
 
-    service_image_waiting_cancel();
+    if (msg_id == VOICE_MSG_SYSTEM_NETWORK_PROBE_FAIL) {
+        if (user_entered_blecfg || s_cloud_ever_connected || s_boot_probe_fail_prompted) {
+            return;
+        }
+        mark_boot_probe_prompted = true;
+    }
 
-    if (evt->button_id != 0) {
+    if (msg_id == VOICE_MSG_WIFI_DISCONNECTED) {
+        if (s_cloud_ever_connected && !user_entered_blecfg && !s_runtime_wifi_prompted) {
+            uint32_t status = QR_STATUS_NOT_CONNECTED;
+            (void)app_should_open_info_by_cloud_state(&status);
+            app_open_cloud_info(status);
+            s_runtime_wifi_prompted = true;
+        }
+
+        if (s_cloud_ever_connected || user_entered_blecfg) {
+            if (!user_entered_blecfg) {
+                app_play_netcfg_tone_once(QR_STATUS_NOT_CONNECTED);
+            }
+            return;
+        }
+    }
+
+    if (user_entered_blecfg) {
         return;
     }
 
-    switch (evt->action) {
-        case VOICE_MSG_BUTTON_ACTION_CLICK:
-        {
-            /* 单击：响铃时稍后提醒；非主页先回主页；主页则触发按键唤醒 */
-            if (alarm_ring_is_active()) {
-                LISA_LOGI(TAG, "Single click: alarm ringing, handle snooze");
-                alarm_handle_snooze();
-                alarm_ring_stop();
-                break;
-            }
+    if (msg_id == VOICE_MSG_SYSTEM_NETWORK_SWITCH_DONE && sys_wifi_has_ap()) {
+        return;
+    }
 
-            if (lisa_ui_nav_scr_get_top_id() != 0) {
-                LISA_LOGI(TAG, "Single click: not on home page, navigating home");
-                lisa_ui_nav_scr_nav_to(0);
-                break;
-            } else {
-                LISA_LOGI(TAG, "Single click: wakeup trigger");
-                if (model_voice_tts_is_playing()) {
-                    LISA_LOGI(TAG, "Single click: TTS playing, stop it");
-                    app_player_stop(tts_player);
-                    break;
-                }
-                if (model_voice_cloud_is_running()) {
-                    voice_msg_pub(VOICE_MSG_CLOUD_MCP_CHAT_EXIT, NULL, 0);
-                } else {
-                    const char keyword[] = "xiao ling xiao ling";
-                    voice_msg_pub(VOICE_MSG_WAKEUP_KEYWORD, (void *)keyword, sizeof(keyword));
-                }
-            }
-            break;
+    /* 4G 模式：NETWORK_SWITCH_DONE 仅表示模组启动完成，网络探测（SNTP）尚未结束。
+     * 此时不应播报配网提示音，应等待 NETWORK_PROBE_FAIL 再做最终判断。 */
+    if (msg_id == VOICE_MSG_SYSTEM_NETWORK_SWITCH_DONE) {
+        sys_network_status_t _guard_net_status;
+        if (sys_network_get_status(&_guard_net_status) == 0 &&
+            _guard_net_status.active_bearer == SYS_NETWORK_BEARER_MODEM) {
+            return;
         }
-        case VOICE_MSG_BUTTON_ACTION_DOUBLE_CLICK:
-        {
-            LISA_LOGI(TAG, "power button double click, image recognition");
-            voice_msg_pub(VOICE_MSG_BUTTON_IMAGE_RECOGNITION, NULL, 0);
-            break;
-        }
-        case VOICE_MSG_BUTTON_ACTION_TRIPLE_CLICK:
-        {
-            /* 三击：打开信息/二维码页 */
-            LISA_LOGI(TAG, "power button triple click, open info page");
-            if (voice_cloud_is_connected()) {
-                app_player_play(tone_player, app_tone_get_url(TONE_ID_104));
-            } else {
-                app_player_play(tone_player, app_tone_get_url(TONE_ID_64));
-            }
-            voice_msg_pub(VOICE_MSG_CLOUD_OPEN_INFO, NULL, 0);
-            break;
-        }
-        case VOICE_MSG_BUTTON_ACTION_QUADRUPLE_CLICK:
-        {
-            /* 四击 */
-            break;
-        }
-        case VOICE_MSG_BUTTON_ACTION_QUINTUPLE_CLICK:
-        case VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK:
-        case VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK:
-        {
-            struct app_datas *app_datas = get_app_datas();
-            /* 连击 >=5：进入 BLE 配网并打开信息页 */
-            LISA_LOGI(TAG, "power button multi click, enter BLE config");
-            service_alarm_deinit();
-            voice_cloud_disconnect();
-            if (app_datas != NULL && !app_datas->wifi_connected) {
-                app_player_play(tone_player, app_tone_get_url(TONE_ID_70));
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            network_reset();
-            app_ble_adv_start(0, 1);
-            voice_msg_pub(VOICE_MSG_CLOUD_OPEN_INFO, NULL, 0);
-            break;
-        }
-        case VOICE_MSG_BUTTON_ACTION_REPEAT_CLICK: 
-        {
-            /* 连击 >=8：恢复出厂 */
-            LISA_LOGI(TAG, "power button repeat click, factory reset");
-            factory_reset();
-            break;
-        }
-        case VOICE_MSG_BUTTON_ACTION_LONG_HOLD:
-        {
-            /* 长按：响铃时停止并生成下一个；否则拍照识图 */
-            if (alarm_ring_is_active()) {
-                LISA_LOGI(TAG, "Double click: alarm ringing, stop and generate next");
-                alarm_ring_stop();
-                alarm_handle_stop_and_next();
-                break;
-            }
-            
-            /* 长按：关机（USB 供电时忽略）*/
-            if (power_is_usb_plugged()) {
-                LISA_LOGI(TAG, "USB connected, ignore long press shutdown");
-            } else {
-                LISA_LOGI(TAG, "power button long press hold, shutting down...");
-                power_shutdown();
-            }
-            break;
-        }
+    }
+
+    uint32_t status = QR_STATUS_CONNECTED;
+    if (!app_should_open_info_by_cloud_state(&status)) {
+        return;
+    }
+
+    LISA_LOGI(TAG, "Cloud unavailable(%u), keep info page on top", (unsigned)status);
+    app_open_cloud_info(status);
+    app_play_netcfg_tone_once(status);
+
+    if (mark_boot_probe_prompted) {
+        s_boot_probe_fail_prompted = true;
     }
 }
 
 int main(int argc, char **argv)
 {
-    LOGI("Application version: %s-%s", PROJECT_VERSION_STR, PROJECT_VERSION_COMMIT);
-
+    extern int boot_watchdog_feed(void);
     boot_watchdog_feed();
 
     voice_msg_sub(VOICE_MSG_SYSTEM_NETWORK_PROBE_SUCCESS, voice_system_network_probe_success, NULL);
+    voice_msg_sub(VOICE_MSG_SYSTEM_NETWORK_PROBE_FAIL, voice_wifi_provision_guard, NULL);
+    voice_msg_sub(VOICE_MSG_CLOUD_CONNECTED, voice_cloud_connected, NULL);
+    voice_msg_sub(VOICE_MSG_CLOUD_CLOUD_AUTH_FAILED, voice_cloud_auth_failed, NULL);
     voice_msg_sub(VOICE_MSG_CLOUD_CLOUD_AUTH_SUCCESS , voice_cloud_auth_success, NULL);
-    voice_msg_sub(VOICE_MSG_BUTTON_CHANGE, button_changed, NULL);
+    voice_msg_sub(VOICE_MSG_WIFI_DISCONNECTED, voice_wifi_provision_guard, NULL);
+    voice_msg_sub(VOICE_MSG_SYSTEM_NETWORK_SWITCH_DONE, voice_wifi_provision_guard, NULL);
 
     service_led_init();
     service_volume_init();
     service_brightness_init();
     service_button_init();
     service_image_init();
-    #if !CONFIG_4G_MODULE
     service_camera_init();
-    #endif
 
+    app_button_init();
+
+    battery_init();
+    service_power_policy_init();
 
 #if CONFIG_APPLICATION_UI
     extern int lisa_ui_init(void);
     lisa_ui_init();
 #endif
 
-    battery_init();
-
-#if CONFIG_WIFI_MANAGER
-    wifi_mgr_sta_config_t list[8] = {0};
-    int count = wifi_mgr_storage_search_ap(list, (int)(sizeof(list) / sizeof(list[0])), SEARCH_ALL, NULL);
-    if (count == 0) {
-        voice_msg_pub(VOICE_MSG_CLOUD_OPEN_INFO, NULL, 0);
-        app_player_play(tone_player, app_tone_get_url(TONE_ID_70));
-    } 
+#ifdef CONFIG_MINIAPP
+    if (miniapp_init() != 0) {
+        LOGE("Miniapp initialization failed");
+    }
 #endif
+    app_show_initial_wifi_info_if_needed();
+    voice_player_network_tone_ui_ready();
+
 
     vTaskDelay(pdMS_TO_TICKS(3000));
     while (1) {

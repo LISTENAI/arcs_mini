@@ -20,6 +20,10 @@
 #include <lisa_mutex.h>
 #include <stdbool.h>
 
+#if CONFIG_LISA_PM
+#include "lisa_pm.h"
+#endif
+
 #define LOG_TAG "lisa_rtc_arcs"
 #include <lisa_log.h>
 
@@ -37,13 +41,15 @@
         }                                                                                                              \
     } while (0)
 
+#define RTC_PERIODIC_EVENT_MASK (LISA_RTC_EVENT_SECOND | LISA_RTC_EVENT_MINUTE | LISA_RTC_EVENT_HOUR)
+
 /* ===== RTC 设备私有数据 ===== */
 typedef struct {
     void *hal_handler;                /* HAL CALENDAR 句柄 */
     lisa_mutex_t *mutex;              /* 互斥锁 */
     lisa_rtc_callback_t callback;     /* 用户回调函数 */
     void *user_data;                  /* 用户数据 */
-    uint32_t enabled_events;          /* 已启用的事件掩码 */
+    volatile uint32_t enabled_events; /* 已启用的事件掩码 */
 } lisa_rtc_priv_t;
 
 /* ===== RTC 设备静态实例 ===== */
@@ -76,6 +82,8 @@ static void rtc_hal_callback(uint32_t event, void *workspace)
     if (event & CSK_CALENDAR_EVENT_HOUR_INT) {
         lisa_event |= LISA_RTC_EVENT_HOUR;
     }
+
+    lisa_event &= priv->enabled_events;
 
     if (lisa_event) {
         priv->callback(lisa_event, priv->user_data);
@@ -356,6 +364,7 @@ static int arcs_rtc_set_periodic_int(lisa_device_t *dev, lisa_rtc_event_t event,
 
     lisa_rtc_priv_t *priv = (lisa_rtc_priv_t *)dev->priv_data;
     uint32_t control = 0;
+    uint32_t enabled_periodic_events = 0;
 
     /* 映射LISA事件到HAL控制位 */
     switch (event) {
@@ -373,6 +382,23 @@ static int arcs_rtc_set_periodic_int(lisa_device_t *dev, lisa_rtc_event_t event,
     }
 
     DEVICE_LOCK(priv);
+    enabled_periodic_events = priv->enabled_events & RTC_PERIODIC_EVENT_MASK;
+
+    if (enable) {
+        if (enabled_periodic_events == event) {
+            DEVICE_UNLOCK(priv);
+            return LISA_DEVICE_OK;
+        }
+
+        if (enabled_periodic_events != 0U) {
+            DEVICE_UNLOCK(priv);
+            LISA_LOGE(LOG_TAG, "Only one periodic interrupt source can be enabled at a time");
+            return LISA_DEVICE_ERR_BUSY;
+        }
+    } else if (enabled_periodic_events != event) {
+        DEVICE_UNLOCK(priv);
+        return LISA_DEVICE_OK;
+    }
 
     if (CALENDAR_Control(priv->hal_handler, control, enable ? 1 : 0) != 0) {
         DEVICE_UNLOCK(priv);
@@ -381,9 +407,9 @@ static int arcs_rtc_set_periodic_int(lisa_device_t *dev, lisa_rtc_event_t event,
     }
 
     if (enable) {
-        priv->enabled_events |= event;
+        priv->enabled_events = (priv->enabled_events & ~RTC_PERIODIC_EVENT_MASK) | event;
     } else {
-        priv->enabled_events &= ~event;
+        priv->enabled_events &= ~RTC_PERIODIC_EVENT_MASK;
     }
 
     DEVICE_UNLOCK(priv);
@@ -442,50 +468,127 @@ static const lisa_rtc_api_t arcs_rtc_api = {
 
 /* ===== 设备初始化函数 ===== */
 
-static int arcs_rtc0_init(void)
+/**
+ * @brief OS 资源初始化（mutex），仅 _init 阶段调用一次，跨 suspend/resume 保留
+ */
+static int arcs_rtc_init_resources(lisa_rtc_priv_t *priv)
 {
-    /* 清空私有数据 */
-    memset(&rtc0_priv, 0, sizeof(lisa_rtc_priv_t));
+    priv->mutex = lisa_mutex_create();
+    if (!priv->mutex) {
+        LISA_LOGE(LOG_TAG, "Failed to create mutex");
+        return LISA_DEVICE_ERR_INIT_FAIL;
+    }
+    return LISA_DEVICE_OK;
+}
 
-    /* 获取 HAL CALENDAR 句柄 */
-    rtc0_priv.hal_handler = CALENDAR();
-    if (!rtc0_priv.hal_handler) {
+/**
+ * @brief 幂等的 CALENDAR HAL 硬件初始化
+ *
+ * RTC 位于 always-on 域，硬件 retention，跨 sleep 不掉电；本函数仍按 Setup S.2
+ * 拆分，与其他驱动保持一致的形态。仅做 HAL 初始化与电源开启，不分配 OS 资源。
+ */
+static int arcs_rtc_init_hw(lisa_rtc_priv_t *priv)
+{
+    priv->hal_handler = CALENDAR();
+    if (!priv->hal_handler) {
         LISA_LOGE(LOG_TAG, "Failed to get CALENDAR handler");
         return LISA_DEVICE_ERR_INIT_FAIL;
     }
 
-    /* 创建互斥锁 */
-    rtc0_priv.mutex = lisa_mutex_create();
-    if (!rtc0_priv.mutex) {
-        LISA_LOGE(LOG_TAG, "Failed to create mutex");
-        return LISA_DEVICE_ERR_INIT_FAIL;
-    }
-
-    /* 初始化 HAL CALENDAR */
-    if (CALENDAR_Initialize(rtc0_priv.hal_handler, rtc_hal_callback, &rtc0_priv) != 0) {
+    if (CALENDAR_Initialize(priv->hal_handler, rtc_hal_callback, priv) != 0) {
         LISA_LOGE(LOG_TAG, "Failed to initialize CALENDAR");
         return LISA_DEVICE_ERR_INIT_FAIL;
     }
 
-    /* 使能 CALENDAR 电源 */
-    if (CALENDAR_PowerControl(rtc0_priv.hal_handler, CSK_POWER_FULL) != 0) {
+    if (CALENDAR_PowerControl(priv->hal_handler, CSK_POWER_FULL) != 0) {
         LISA_LOGE(LOG_TAG, "Failed to power on CALENDAR");
         return LISA_DEVICE_ERR_INIT_FAIL;
     }
 
     /* 启用校准功能（可选） */
-    CALENDAR_Control(rtc0_priv.hal_handler, CSK_CALENDAR_CTRL_CALIBRATION_EN, 1);
+    CALENDAR_Control(priv->hal_handler, CSK_CALENDAR_CTRL_CALIBRATION_EN, 1);
+
+    return LISA_DEVICE_OK;
+}
+
+static int arcs_rtc0_init(void)
+{
+    /* 清空私有数据 */
+    memset(&rtc0_priv, 0, sizeof(lisa_rtc_priv_t));
+
+    int ret = arcs_rtc_init_resources(&rtc0_priv);
+    if (ret != LISA_DEVICE_OK) {
+        return ret;
+    }
+
+    ret = arcs_rtc_init_hw(&rtc0_priv);
+    if (ret != LISA_DEVICE_OK) {
+        return ret;
+    }
 
     LISA_LOGI(LOG_TAG, "RTC0 initialized successfully");
 
     return LISA_DEVICE_OK;
 }
 
+/* ===== 设备反初始化函数 ===== */
+
+/**
+ * @brief 停止并释放 RTC0 设备的全部软硬件资源，恢复芯片上电初始状态
+ *
+ * 由 lisa_device_destroy() 调用。释放顺序与 arcs_rtc0_init 申请相反：
+ *   1) HAL 下电：先 CALENDAR_PowerControl(OFF) 再 CALENDAR_Uninitialize；
+ *   2) 释放 OS 资源 mutex；
+ *   3) memset 整个 priv，回到 _init 之前的零初值。
+ *
+ * 注意：RTC 位于 always-on 域，PM 自动轻睡眠路径下 check_idle 恒返 1、绝不销毁本设备
+ * （否则会破坏时间源 / 闹钟唤醒语义）；本 deinit 仅服务于业务显式 lisa_device_destroy()。
+ * 约定：调用方需保证此时无并发业务在使用本设备。
+ */
+static int arcs_rtc0_deinit(void)
+{
+    lisa_rtc_priv_t *priv = &rtc0_priv;
+
+    if (priv->hal_handler) {
+        CALENDAR_PowerControl(priv->hal_handler, CSK_POWER_OFF);
+        CALENDAR_Uninitialize(priv->hal_handler);
+    }
+
+    if (priv->mutex) {
+        lisa_mutex_delete(priv->mutex);
+    }
+
+    memset(&rtc0_priv, 0, sizeof(lisa_rtc_priv_t));
+    return LISA_DEVICE_OK;
+}
+
+#if CONFIG_LISA_PM
+/* ===== System PM 回调 =====
+ *
+ * 与 lisa_audio 一致，本驱动采用“睡前 destroy / 唤醒后 reinit”模型：业务可显式调
+ * lisa_device_destroy(rtc0) 释放资源、唤醒后 lisa_device_reinit(rtc0) 重建。因此
+ * prepare_suspend / resume_restore 不再需要（原为空占位，已被 destroy/reinit 覆盖）。
+ *
+ * 仅保留 check_idle：RTC（CALENDAR）位于 always-on 域、硬件 retention，且常作为时间源 /
+ * 闹钟唤醒源，故恒返 1（始终允许自动轻睡眠、绝不因 RTC 阻塞整机，也不在 PM 路径销毁）。
+ */
+static int32_t arcs_rtc_pm_check_idle(void *ctx)
+{
+    (void)ctx;
+    return 1;
+}
+
+static const lisa_pm_system_ops_t arcs_rtc_pm_ops = {
+    .check_idle      = arcs_rtc_pm_check_idle,
+    .prepare_suspend = NULL,
+    .resume_restore  = NULL,
+};
+#endif /* CONFIG_LISA_PM */
+
+
 /* ===== 设备注册 ===== */
-LISA_DEVICE_REGISTER(rtc0,                        /* 设备名称 */
-                     &arcs_rtc_api,               /* API指针 */
-                     &rtc0_priv,                  /* 私有数据指针 */
-                     NULL,                        /* 用户数据 */
-                     arcs_rtc0_init,              /* 初始化函数 */
-                     LISA_DEVICE_LEVEL_NORMAL,    /* 级别 */
-                     LISA_DEVICE_PRIORITY_NORMAL); /* 优先级 */
+LISA_DEVICE_REGISTER_DEINIT(rtc0, &arcs_rtc_api, &rtc0_priv, NULL, arcs_rtc0_init,
+                            arcs_rtc0_deinit, LISA_DEVICE_LEVEL_NORMAL, LISA_DEVICE_PRIORITY_NORMAL);
+#if CONFIG_LISA_PM
+LISA_DEVICE_PM_ATTACH(rtc0, &arcs_rtc_pm_ops, NULL, &rtc0_priv);
+#endif

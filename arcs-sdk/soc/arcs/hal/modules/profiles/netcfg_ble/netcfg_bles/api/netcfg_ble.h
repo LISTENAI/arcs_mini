@@ -17,7 +17,7 @@
 #include "log_print.h"
 
 #define NETCFG_BLE_PREFIX_ID    0x03e4
-#define NETCFG_BLE_DBG          1
+#define NETCFG_BLE_DBG          0
 
 #define NETCFG_BLE_SSID_MAX_LEN 36
 #define NETCFG_BLE_PWD_MAX_LEN  64
@@ -48,6 +48,7 @@ enum netcfg_ble_op {
     NETCFG_BLE_OP_REBOOT,
 
     NETCFG_BLE_AUTH_INFO = 0xA012, // auth info
+    NETCFG_BLE_OP_SKIP_WIFI = 0xA013,
     NETCFG_BLE_OP_MAX,
 };
 

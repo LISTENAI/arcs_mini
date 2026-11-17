@@ -25,7 +25,7 @@ const camera_sensor_info_t camera_sensor[CAMERA_MODEL_MAX] = {
     {CAMERA_BF20A6, "BF20A6", BF20A6_SCCB_ADDR, BF20A6_PID, 640, 480, (PIXFORMAT_MASK_RGB565 | PIXFORMAT_MASK_YUV422)},
     {CAMERA_BF3901, "BF3901", BF3901_SCCB_ADDR, BF3901_PID, 320, 240, (PIXFORMAT_MASK_RGB565 | PIXFORMAT_MASK_YUV422)},
     {CAMERA_SC101IOT, "SC101IOT", SC101IOT_SCCB_ADDR, SC101IOT_PID, 1280, 720, (PIXFORMAT_MASK_RGB565 | PIXFORMAT_MASK_YUV422)},
-    {CAMERA_SC030IOT, "SC030IOT", SC030IOT_SCCB_ADDR, SC030IOT_PID, 640, 480, (PIXFORMAT_MASK_RGB565 | PIXFORMAT_MASK_YUV422)},
+    {CAMERA_SC030IOT, "SC030IOT", SC030IOT_SCCB_ADDR, SC030IOT_PID, 640, 480, (PIXFORMAT_MASK_YUV422)},
     {CAMERA_SC031GS, "SC031GS", SC031GS_SCCB_ADDR, SC031GS_PID, 640, 480, (PIXFORMAT_MASK_RGB565 | PIXFORMAT_MASK_YUV422)},
     {CAMERA_OV9655, "OV9655", OV9655_SCCB_ADDR, OV9655_PID, 640, 480, (PIXFORMAT_MASK_RGB565 | PIXFORMAT_MASK_YUV422)},
     {CAMERA_TC6036, "TC6036", TC6036_SCCB_ADDR, TC6036_PID, 640, 480, (PIXFORMAT_MASK_RGB565 | PIXFORMAT_MASK_YUV422)},
@@ -129,21 +129,33 @@ static int _twi_read(uint8_t slv_addr, uint16_t reg, unsigned char *value, bool 
 
 uint8_t sensor_twi_read_reg8(uint8_t slv_addr, uint8_t reg)
 {
-    int ret = 0;
     uint8_t value = 0;
+
+    (void)sensor_twi_read_reg8_checked(slv_addr, reg, &value);
+    return value;
+}
+
+int sensor_twi_read_reg8_checked(uint8_t slv_addr, uint8_t reg, uint8_t *value)
+{
+    int ret = 0;
     int cnt = 0;
 
-    ret = _twi_read(slv_addr, reg, &value, false);
+    if (!value) {
+        return -1;
+    }
+
+    *value = 0;
+    ret = _twi_read(slv_addr, reg, value, false);
     while (ret != 0 && cnt < 2) {
         CLOGW("twi read retry %d\r\n", cnt);
-        ret = _twi_read(slv_addr, reg, &value, false);
+        ret = _twi_read(slv_addr, reg, value, false);
         // log....
         cnt++;
     }
     // if (cnt > 0)
         // log...
 
-    return value;
+    return ret;
 }
 
 uint8_t sensor_twi_read_reg16(uint8_t slv_addr, uint16_t reg)

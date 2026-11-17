@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "lisa/ultis.h"
@@ -13,6 +14,14 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Optional application policy for each start frame. Return a static string or
+ * NULL to omit nlu_properties.custom.mode. Called from the session task. */
+const char *lsc_get_nlu_custom_mode(void);
+
+/* Copy the foreground miniapp identity for the current start frame. */
+bool lsc_get_nlu_custom_miniapp(char *id, size_t id_size,
+					char *version, size_t version_size);
 
 /* clang-format off */
 #define STRINGS_LSC_EVT(evt)                                             	\
@@ -166,6 +175,30 @@ int lsc_connect(void);
  * @retval 0： 成功
  */
 int lsc_disconnect(void);
+
+/**
+ * @brief 暂停或恢复 LSC 内部主动发起的网络请求
+ *
+ * 暂停后自动重连、鉴权、音乐 HTTP 请求会停止发起；已进入底层网络栈的请求
+ * 需要通过 lsc_wait_network_idle() 等待退出。
+ *
+ * @retval 0： 成功
+ */
+int lsc_set_network_suspended(bool suspended);
+
+/**
+ * @brief 等待 LSC 内部正在执行的网络请求全部结束
+ *
+ * @param timeout_ms 最长等待时间，单位毫秒
+ *
+ * @retval 0： 成功
+ */
+int lsc_wait_network_idle(uint32_t timeout_ms);
+
+/**
+ * @brief 查询 LSC 网络请求是否处于暂停状态
+ */
+bool lsc_is_network_suspended(void);
 
 /**
  * @brief LSP组件逆初始化

@@ -9,6 +9,13 @@
 
 static UART_RegDef *uart = NULL;
 
+__attribute__((weak)) uint32_t cloglvl = 0;
+
+__attribute__((weak)) void logDbg(const char *format, ...)
+{
+    (void)format;
+}
+
 static uint32_t compute_gcd(uint32_t a, uint32_t c)
 {
     uint32_t t;

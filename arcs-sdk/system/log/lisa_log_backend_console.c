@@ -9,6 +9,8 @@
 
 static void log_console_output(const uint8_t *log, uint32_t len, void *data)
 {
+    (void)data;
+
     console_write((const char *)log, len);
 }
 

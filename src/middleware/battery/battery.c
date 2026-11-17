@@ -17,7 +17,23 @@
 #define BAT_ADC_PAD CONFIG_BATTERY_COLLECTION_ADC_PAD
 #define BAT_ADC_CH  CONFIG_BATTERY_COLLECTION_ADC_CHANNEL
 
-#define CHARGE_DET_PAD CONFIG_BATTERY_COLLECTION_CHARGE_DETECT_PAD
+#if defined(BAT_TEMP_ADC_DEVICE_NAME) && defined(BAT_TEMP_ADC_CHANNEL)
+#define BAT_TEMP_ADC_ENABLE 1
+#else
+#define BAT_TEMP_ADC_ENABLE 0
+#endif
+
+#ifdef CHARGE_DET_DEVICE_NAME
+#define BATTERY_CHARGE_DET_PAD CHARGE_DET_DEVICE_NAME
+#else
+#define BATTERY_CHARGE_DET_PAD CONFIG_BATTERY_COLLECTION_CHARGE_DETECT_PAD
+#endif
+
+#define BATTERY_CHARGE_DET_PIN CHARGE_DET_PIN
+
+#ifndef CHARGE_DET_ACTIVE_LEVEL
+#define CHARGE_DET_ACTIVE_LEVEL 1
+#endif
 
 #define VBAT_MAX_VOLTAGE                (4350) /* 锂电池理论最大电压 */
 #define VBAT_MIN_VOLTAGE                (3500) /* 锂电池理论最小电压 */
@@ -29,12 +45,18 @@
 /* USB 插拔去抖：连续 N 次采样一致才认为状态变化（1次=1s） */
 #define USB_PLUGGED_DEBOUNCE_TICKS (3)
 
+/* 充电检测去抖：连续 N 次采样一致才认为状态变化（1次=1s） */
+#define CHARGE_DET_DEBOUNCE_TICKS (3)
+
 /* 低于该电压认为未接入电池，单位mV */
 #define VBAT_PRESENT_THRESHOLD (2000)
 
 #define VOLTAGE_FILTER_WINDOW_SIZE 5
 
 static lisa_device_t *bat_adc_dev __psram_bss__ = NULL;
+#if BAT_TEMP_ADC_ENABLE
+static lisa_device_t *bat_temp_adc_dev __psram_bss__ = NULL;
+#endif
 static lisa_device_t *charge_det_dev __psram_bss__ = NULL;
 
 // 移动平均滤波器变量
@@ -65,6 +87,61 @@ bool battery_usb_plugged_stable_get(void)
     return stable_state;
 }
 
+static bool battery_charge_detected_raw_get(bool *valid)
+{
+    if (valid) {
+        *valid = false;
+    }
+
+    if (!lisa_device_ready(charge_det_dev)) {
+        return false;
+    }
+
+    int level = lisa_gpio_read_pin(charge_det_dev, BATTERY_CHARGE_DET_PIN);
+    if (level < 0) {
+        return false;
+    }
+
+    if (valid) {
+        *valid = true;
+    }
+
+    return (level == (CHARGE_DET_ACTIVE_LEVEL ? LISA_GPIO_HIGH : LISA_GPIO_LOW));
+}
+
+static bool battery_charge_detected_stable_get(void)
+{
+    static bool raw_last __psram_bss__ = false;
+    static bool stable_state __psram_bss__ = false;
+    static uint8_t stable_cnt __psram_bss__ = 0;
+
+    bool valid = false;
+    bool raw_now = battery_charge_detected_raw_get(&valid);
+    if (!valid) {
+        stable_cnt = 0;
+        stable_state = false;
+        return false;
+    }
+
+    if (raw_now != raw_last) {
+        raw_last = raw_now;
+        stable_cnt = 0;
+    } else if (stable_cnt < CHARGE_DET_DEBOUNCE_TICKS) {
+        stable_cnt++;
+    }
+
+    if (stable_cnt >= CHARGE_DET_DEBOUNCE_TICKS) {
+        stable_state = raw_now;
+    }
+
+    return stable_state;
+}
+
+static bool battery_external_power_stable_get(void)
+{
+    return battery_usb_plugged_stable_get();
+}
+
 // 电池电压百分比查找表 (按10%步进，从0%到100%)
 // 请根据实际电池特性填充对应的电压值 (单位: mV)
 //
@@ -75,36 +152,36 @@ bool battery_usb_plugged_stable_get(void)
 // 4. 多次测量取平均值以提高准确性
 //
 // 数据来源：240032-7-6/7/8 实测恒流放电（155mA）曲线，3组取平均值
-// 截止电压约 3.0V，满电开路电压约 4.20V（155mA 负载下测量值）
+// 结合整机实测校准：拔掉 USB 后 4.00V 及以上视为满电，修正量按档位逐级分摊
 static const uint16_t battery_voltage_table_discharge[11] = {
     3010, // 0%  - 实测截止电压（约3.0V）
-    3440, // 10%
-    3576, // 20%
-    3719, // 30%
-    3781, // 40%
-    3820, // 50%
-    3860, // 60%
-    3925, // 70%
-    3973, // 80%
-    4013, // 90%
-    4160  // 100% - 满电端电压（155mA 负载）
+    3424, // 10%
+    3544, // 20%
+    3671, // 30%
+    3717, // 40%
+    3740, // 50%
+    3764, // 60%
+    3813, // 70%
+    3845, // 80%
+    3869, // 90%
+    4000  // 100% - 拔掉 USB 后的整机满电阈值
 };
 
 // 充电电压百分比查找表 (按10%步进，从0%到100%)
 // 数据来源：240032-7-6/7/8 实测恒流恒压充电（500mA CC / 4.2V CV）曲线，3组取平均值
-// 说明：CC 阶段端电压上升较快（0%→10% 区间）；CV 阶段（10%→100%）电压在 4.04~4.20V 缓慢上升
+// 结合整机实测校准：插着 USB 时 4.10V 及以上视为满电，修正量按档位逐级分摊
 static const uint16_t battery_voltage_table_charge[11] = {
     3257, // 0%  - 充电起始端电压（近空电池，500mA 充电开始）
-    3677, // 10%
-    3757, // 20%
-    3850, // 30%
-    3943, // 40%
-    4002, // 50%
-    4039, // 60%
-    4071, // 70%
-    4103, // 80%
-    4150, // 90%
-    4200  // 100% - CV 截止电压
+    3667, // 10%
+    3737, // 20%
+    3820, // 30%
+    3903, // 40%
+    3952, // 50%
+    3979, // 60%
+    4001, // 70%
+    4023, // 80%
+    4060, // 90%
+    4100  // 100% - 插着 USB 时的整机满电阈值
 };
 
 /**
@@ -187,15 +264,31 @@ static void battery_sample_pin_init(void)
 {
     // Vbat voltage adc sample
     bat_adc_dev = lisa_device_get("adc0");
-    lisa_adc_channel_config_t adc_ch_cfg = {
-        .reference = LISA_ADC_REF_VDD_3V6,
-        .resolution = LISA_ADC_RESOLUTION_10BIT,
-    };
-    lisa_adc_channel_setup(bat_adc_dev, BAT_ADC_CH, &adc_ch_cfg);
+    if (lisa_device_ready(bat_adc_dev)) {
+        lisa_adc_channel_config_t adc_ch_cfg = {
+            .reference = LISA_ADC_REF_VDD_3V6,
+            .resolution = LISA_ADC_RESOLUTION_10BIT,
+        };
+        lisa_adc_channel_setup(bat_adc_dev, BAT_ADC_CH, &adc_ch_cfg);
+    } else {
+        LISA_LOGW(TAG, "ADC device adc0 not ready");
+    }
+
+#if BAT_TEMP_ADC_ENABLE
+    // Battery temperature ADC sample from CH32V003 exadc.
+    bat_temp_adc_dev = lisa_device_get(BAT_TEMP_ADC_DEVICE_NAME);
+    if (!lisa_device_ready(bat_temp_adc_dev)) {
+        LISA_LOGW(TAG, "CH32 ADC device %s not ready", BAT_TEMP_ADC_DEVICE_NAME);
+    }
+#endif
 
     // charge status
-    charge_det_dev = lisa_device_get(CHARGE_DET_PAD);
-    lisa_gpio_configure(charge_det_dev, CHARGE_DET_PIN, LISA_GPIO_INPUT);
+    charge_det_dev = lisa_device_get(BATTERY_CHARGE_DET_PAD);
+    if (lisa_device_ready(charge_det_dev)) {
+        lisa_gpio_configure(charge_det_dev, BATTERY_CHARGE_DET_PIN, LISA_GPIO_CONFIG_INPUT_PULLDOWN);
+    } else {
+        LISA_LOGW(TAG, "Charge detect device %s not ready", BATTERY_CHARGE_DET_PAD);
+    }
 }
 
 void battery_init(void)
@@ -221,13 +314,21 @@ uint16_t battery_get_voltage_mv(void)
     uint16_t vbat_real_voltage;
     uint16_t filtered_voltage;
 
-    lisa_adc_read(bat_adc_dev, BAT_ADC_CH, &adc_raw_value);
+    if (!lisa_device_ready(bat_adc_dev)) {
+        LISA_LOGW(TAG, "ADC device not ready");
+        return 0;
+    }
+
+    if (lisa_adc_read(bat_adc_dev, BAT_ADC_CH, &adc_raw_value) != LISA_DEVICE_OK) {
+        LISA_LOGW(TAG, "ADC read failed");
+        return 0;
+    }
     adc_real_voltage = LISA_ADC_RAW_TO_MV(adc_raw_value, 3600, LISA_ADC_RESOLUTION_10BIT);
 
     /* remove Hardware voltage division  */
     vbat_real_voltage = (uint16_t)(adc_real_voltage * 100 / VBAT_PARTIAL_VOLTAGE_PERCENTAGE);
 
-    usb_plugged = battery_usb_plugged_stable_get();
+    usb_plugged = battery_external_power_stable_get();
     if (usb_plugged != last_usb_plugged) {
         // 充电状态变化时，重置滤波，避免电压跳变被均值拖尾
         voltage_filter_reset(vbat_real_voltage);
@@ -244,6 +345,40 @@ uint16_t battery_get_voltage_mv(void)
     return filtered_voltage;
 }
 
+static void battery_temp_adc_raw_parse(uint16_t adc_raw_value)
+{
+#if BAT_TEMP_ADC_ENABLE
+    LISA_LOGI(TAG, "ch32 adc raw: dev=%s, ch=%d, raw=%u",
+              BAT_TEMP_ADC_DEVICE_NAME, BAT_TEMP_ADC_CHANNEL, (unsigned int)adc_raw_value);
+#else
+    (void)adc_raw_value;
+#endif
+}
+
+uint16_t battery_get_temp_adc_raw(void)
+{
+#if BAT_TEMP_ADC_ENABLE
+    uint16_t adc_raw_value = LISA_ADC_VALUE_INVALID;
+
+    if (!lisa_device_ready(bat_temp_adc_dev)) {
+        LISA_LOGW(TAG, "CH32 ADC device %s not ready", BAT_TEMP_ADC_DEVICE_NAME);
+        return LISA_ADC_VALUE_INVALID;
+    }
+
+    int ret = lisa_adc_read(bat_temp_adc_dev, BAT_TEMP_ADC_CHANNEL, &adc_raw_value);
+    if (ret != LISA_DEVICE_OK) {
+        LISA_LOGW(TAG, "CH32 ADC read failed: dev=%s, ch=%d, ret=%d",
+                  BAT_TEMP_ADC_DEVICE_NAME, BAT_TEMP_ADC_CHANNEL, ret);
+        return LISA_ADC_VALUE_INVALID;
+    }
+
+    battery_temp_adc_raw_parse(adc_raw_value);
+    return adc_raw_value;
+#else
+    return LISA_ADC_VALUE_INVALID;
+#endif
+}
+
 uint8_t battery_get_pct_raw(void)
 {
     uint16_t filtered_voltage;
@@ -252,7 +387,7 @@ uint8_t battery_get_pct_raw(void)
     uint16_t discharge_cutoff_voltage = battery_voltage_table_discharge[0];
 
     filtered_voltage = battery_get_voltage_mv();
-    usb_plugged = battery_usb_plugged_stable_get();
+    usb_plugged = battery_external_power_stable_get();
 
     // 低电压关机保护（仅在未插 USB 时生效，且需要连续确认）
     if (!usb_plugged && filtered_voltage < discharge_cutoff_voltage) {
@@ -301,9 +436,9 @@ battery_status_t battery_get_status(void)
         ret = BATTERY_STATUS_NOT_CONNECT;
     }
 
-    bool usb_plugged = battery_usb_plugged_stable_get();
+    bool external_power = battery_usb_plugged_stable_get();
 
-    if (usb_plugged) {
+    if (external_power) {
         if (s_discharge_static_cnt < 3) {
             s_discharge_static_cnt++;
         }else{
@@ -313,8 +448,7 @@ battery_status_t battery_get_status(void)
         s_discharge_static_cnt = 0;
     }
 
-    const uint16_t *table = usb_plugged ? battery_voltage_table_charge : battery_voltage_table_discharge;
-    if (usb_plugged && voltage_to_percentage_by_table(filtered_voltage, table) >= 98) {
+    if (external_power && filtered_voltage >= battery_voltage_table_charge[10]) {
         ret = BATTERY_STATUS_CHARGE_DONE;
     }
     

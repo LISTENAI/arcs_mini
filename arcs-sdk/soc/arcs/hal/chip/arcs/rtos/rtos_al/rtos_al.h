@@ -71,6 +71,8 @@ enum rtos_task_id
     IPC_MSG_TASK,
     IPC_WIFI_TX_TASK,
     IPC_WIFI_RX_TASK,
+    IPC_BT_HOST_TASK,
+    IPC_BT_CTRL_TASK,
     AGING_TEST_TASK,
     WPA_CONNECTED_TASK,
     EVENT_TASK,
@@ -80,6 +82,7 @@ enum rtos_task_id
     APP_INIT_TASK,
     IPC_DBG_TASK,
     HALT_CORE_TASK,
+    FREQ_OFFSET_TASK,
     MAX_TASK,
     UNDEF_TASK = 255,
 };
@@ -569,7 +572,7 @@ rtos_timer rtos_timer_create(void *id, bool reload, uint32_t period_ms, TimerCal
 int32_t rtos_timer_start(rtos_timer timer);
 int32_t rtos_timer_stop(rtos_timer timer);
 int32_t rtos_timer_reload(rtos_timer timer);
-int32_t rtos_timer_destroy(rtos_timer timer);
+int32_t rtos_timer_delete(rtos_timer timer);
 void rtos_timer_id_set(rtos_timer timer, void *id);
 void *rtos_timer_id_get(rtos_timer timer);
 void rtos_timer_set_reload_mode(rtos_timer timer, bool reload);

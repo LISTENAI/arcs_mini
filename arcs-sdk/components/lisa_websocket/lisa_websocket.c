@@ -40,10 +40,16 @@ struct lisa_ws {
     lisa_semaphore_t *pong_sem;
     lisa_semaphore_t *connect_sem;
     uint32_t pong_max_time_ms;
+    uint32_t last_ping_sent_ms; /* 硬速率限制：距上次 PING 至少隔 pong_max_time_ms */
     uint8_t ping_pong_lost_cnt;
     lisa_thread_t *thread;
     noPollCtx *nopoll_ctx;
     noPollConn *nopoll_conn;
+    char *rx_msg_buf;
+    uint32_t rx_msg_len;
+    uint32_t rx_msg_cap;
+    lisa_ws_data_type_e rx_msg_type;
+    bool rx_msg_active;
 };
 
 typedef struct {
@@ -55,9 +61,94 @@ typedef struct {
 
 static void lisa_websocket_thread(void *param);
 
+static void lisa_websocket_rx_msg_reset(lisa_ws_t *ins)
+{
+    if (ins == NULL) {
+        return;
+    }
+
+    if (ins->rx_msg_buf != NULL) {
+        lisa_mem_free(ins->rx_msg_buf);
+        ins->rx_msg_buf = NULL;
+    }
+
+    ins->rx_msg_len = 0;
+    ins->rx_msg_cap = 0;
+    ins->rx_msg_type = LISA_WS_TEXT;
+    ins->rx_msg_active = false;
+}
+
+static int lisa_websocket_rx_msg_reserve(lisa_ws_t *ins, uint32_t need)
+{
+    char *buf;
+    uint32_t new_cap;
+
+    if (need <= ins->rx_msg_cap) {
+        return 0;
+    }
+
+    new_cap = ins->rx_msg_cap ? ins->rx_msg_cap : 256;
+    while (new_cap < need) {
+        if (new_cap > UINT32_MAX / 2) {
+            new_cap = need;
+            break;
+        }
+        new_cap *= 2;
+    }
+
+    buf = ins->rx_msg_buf ? lisa_mem_realloc(ins->rx_msg_buf, new_cap) : lisa_mem_alloc(new_cap);
+    if (buf == NULL) {
+        LISA_NLOGE("rx msg buf alloc failed, need:%u", need);
+        return -1;
+    }
+
+    ins->rx_msg_buf = buf;
+    ins->rx_msg_cap = new_cap;
+    return 0;
+}
+
+static int lisa_websocket_rx_msg_append(lisa_ws_t *ins, const void *data, uint32_t len, lisa_ws_data_type_e type, bool start)
+{
+    if (start) {
+        if (ins->rx_msg_active) {
+            LISA_NLOGW("drop unfinished websocket message, len:%u", ins->rx_msg_len);
+            lisa_websocket_rx_msg_reset(ins);
+        }
+        ins->rx_msg_type = type;
+        ins->rx_msg_active = true;
+    } else if (!ins->rx_msg_active) {
+        LISA_NLOGE("unexpected websocket continuation frame");
+        return -1;
+    }
+
+    if (lisa_websocket_rx_msg_reserve(ins, ins->rx_msg_len + len + 1) != 0) {
+        lisa_websocket_rx_msg_reset(ins);
+        return -1;
+    }
+
+    if (len > 0) {
+        memcpy(ins->rx_msg_buf + ins->rx_msg_len, data, len);
+        ins->rx_msg_len += len;
+    }
+    ins->rx_msg_buf[ins->rx_msg_len] = 0;
+    return 0;
+}
+
+static void lisa_websocket_rx_msg_dispatch(lisa_ws_t *ins, const void *msg, uint32_t len, lisa_ws_data_type_e type)
+{
+    lisa_ws_data_t ws_data;
+
+    ws_data.type = type;
+    ws_data.user = ins->user;
+    ws_data.buf = msg;
+    ws_data.len = len;
+    ins->inter_on_data(&ws_data);
+}
+
 static void _callback_ws_disconnect(lisa_ws_t *handle)
 {
     if (handle) {
+        lisa_websocket_rx_msg_reset(handle);
         handle->ws_conn = false;
         lisa_ws_event_t ws_event;
         ws_event.what = LISA_WS_ON_DISCONNECTED;
@@ -109,6 +200,7 @@ lisa_ws_t *lisa_ws_init(lisa_ws_request_t *req)
         handle->inter_on_data = req->on_data;
     }
     handle->pong_max_time_ms = WS_PINGPONG_TIMEOUT_MS;
+    handle->last_ping_sent_ms = 0;
 
     handle->tx_msg_queue = lisa_queue_create(WS_QUEUE_COUNT, "ws_tx_msg", sizeof(lisa_ws_msg_t));
     if (handle->tx_msg_queue == NULL) {
@@ -257,9 +349,12 @@ static int lisa_websocket_msg_fragment_remain_recv(lisa_ws_t *ins, noPollConn *n
 static int lisa_websocket_msg_recv_proc(lisa_ws_t *ins, noPollConn *nopoll_conn)
 {
     noPollMsg *nopoll_msg;
-    nopoll_msg = nopoll_conn_get_msg(nopoll_conn);
-    bool fragment_msg = false;
+    noPollOpCode opcode;
+    bool final_frame;
+    bool partial_frame = false;
+    lisa_ws_data_type_e data_type;
 
+    nopoll_msg = nopoll_conn_get_msg(nopoll_conn);
     if (nopoll_msg == NULL) {
         return -1;
     }
@@ -279,8 +374,11 @@ static int lisa_websocket_msg_recv_proc(lisa_ws_t *ins, noPollConn *nopoll_conn)
         return 0;
     }
 
-    /* reframe msg if it is a fragment */
-    if (nopoll_msg->is_fragment) {
+    opcode = nopoll_msg_opcode(nopoll_msg);
+    final_frame = nopoll_msg->has_fin != 0;
+
+    /* Finish reading the current frame before websocket message reassembly. */
+    if (nopoll_msg->remain_bytes > 0) {
         uint32_t total_size = nopoll_msg->remain_bytes + nopoll_msg->payload_size;
         LISA_NLOGD("msg is a fragment, remain:%d, payload size:%ld, total:%d, payload: %s", nopoll_msg->remain_bytes,
                    nopoll_msg->payload_size, total_size, msg);
@@ -301,19 +399,37 @@ static int lisa_websocket_msg_recv_proc(lisa_ws_t *ins, noPollConn *nopoll_conn)
         buf[total_size] = 0;
         msg = buf;
         len = total_size;
-        fragment_msg = true;
+        partial_frame = true;
     }
 
-    /* complete msg received */
-    lisa_ws_data_t ws_data;
-    ws_data.type = (nopoll_msg->op_code == NOPOLL_TEXT_FRAME ? LISA_WS_TEXT : LISA_WS_BIN);
-    ws_data.user = ins->user;
-    ws_data.buf = msg;
-    ws_data.len = len;
-    ins->inter_on_data(&ws_data);
+    if (opcode == NOPOLL_TEXT_FRAME) {
+        data_type = LISA_WS_TEXT;
+    } else if (opcode == NOPOLL_BINARY_FRAME) {
+        data_type = LISA_WS_BIN;
+    } else if (opcode == NOPOLL_CONTINUATION_FRAME) {
+        data_type = ins->rx_msg_type;
+    } else {
+        data_type = LISA_WS_BIN;
+    }
+
+    if (opcode == NOPOLL_CONTINUATION_FRAME) {
+        if (lisa_websocket_rx_msg_append(ins, msg, len, data_type, false) == 0 && final_frame) {
+            lisa_websocket_rx_msg_dispatch(ins, ins->rx_msg_buf, ins->rx_msg_len, ins->rx_msg_type);
+            lisa_websocket_rx_msg_reset(ins);
+        }
+    } else if (!final_frame) {
+        (void)lisa_websocket_rx_msg_append(ins, msg, len, data_type, true);
+    } else {
+        if (ins->rx_msg_active) {
+            LISA_NLOGW("drop unfinished websocket message before direct dispatch, len:%u", ins->rx_msg_len);
+            lisa_websocket_rx_msg_reset(ins);
+        }
+        lisa_websocket_rx_msg_dispatch(ins, msg, len, data_type);
+    }
+
     /* release msg */
     nopoll_msg_unref(nopoll_msg);
-    if (fragment_msg) {
+    if (partial_frame) {
         lisa_mem_free((void *)msg);
     }
 
@@ -490,6 +606,7 @@ err_exit:
 static int lisa_websocket_nopoll_send_recv_proc(lisa_ws_t *ins)
 {
     uint32_t last_pong_time_ms = lisa_os_get_tick_ms();
+    ins->last_ping_sent_ms = 0;
 
     while (1) {
         int err;
@@ -508,15 +625,31 @@ static int lisa_websocket_nopoll_send_recv_proc(lisa_ws_t *ins)
         /* min block time: 20ms */
         lisa_websocket_msg_send_proc(ins, ins->nopoll_conn);
         send_cost_time = lisa_os_get_tick_ms() - send_cost_time;
+        /* clamp: 单次慢发送不应撑大 pong 等待预算 */
+        if ((uint32_t)send_cost_time > ins->pong_max_time_ms) {
+            send_cost_time = (int)ins->pong_max_time_ms;
+        }
         if (lisa_websocket_need_to_exit(ins)) {
             break;
         }
         lisa_websocket_msg_recv_proc(ins, ins->nopoll_conn);
 
 #if CONFIG_NOPOLL_DELIVER_PONG_FRAME_ENABLED
-        /* websocket ping pong check */
-        if ((lisa_os_get_tick_ms() - last_pong_time_ms) >= ins->pong_max_time_ms / 2) {
-            nopoll_conn_send_ping(ins->nopoll_conn);
+        /* websocket ping pong check — 硬速率限制 + 忽略 send_ping 返回值 */
+        uint32_t now_ms = lisa_os_get_tick_ms();
+        if ((now_ms - ins->last_ping_sent_ms) >= ins->pong_max_time_ms) {
+            (void)nopoll_conn_send_ping(ins->nopoll_conn);
+            ins->last_ping_sent_ms = now_ms;
+            /*
+             * 发 ping 时重置 pong 计时器：让 pong 超时从 ping 发送时刻算起而不是
+             * 从上一个 pong 算起，给对端 pong_max_time_ms 的时间来回复。
+             *
+             * 仅在上周期没有丢 pong 时（lost_cnt == 0）才重置，避免对端已经
+             * 无响应时无限推迟超时。
+             */
+            if (ins->ping_pong_lost_cnt == 0) {
+                last_pong_time_ms = now_ms;
+            }
         }
         err = lisa_semaphore_take(ins->pong_sem, 0);
         if (err == 0) {
@@ -524,9 +657,11 @@ static int lisa_websocket_nopoll_send_recv_proc(lisa_ws_t *ins)
             ins->ping_pong_lost_cnt = 0;
         } else {
             if ((lisa_os_get_tick_ms() - last_pong_time_ms) >= (ins->pong_max_time_ms + send_cost_time)) {
-                LISA_NLOGE("recv websocket pong msg timeout, curr:%d, last:%d, "
-                           "timeout:%d, send cost time:%d, lost cnt:%d",
-                           lisa_os_get_tick_ms(), last_pong_time_ms, ins->pong_max_time_ms, send_cost_time,
+                LISA_NLOGE("recv websocket pong msg timeout, curr:%lu, last:%lu, "
+                           "timeout:%lu, send cost time:%d, lost cnt:%d",
+                           (unsigned long)(uint32_t)lisa_os_get_tick_ms(),
+                           (unsigned long)last_pong_time_ms,
+                           (unsigned long)ins->pong_max_time_ms, send_cost_time,
                            ins->ping_pong_lost_cnt);
                 last_pong_time_ms = lisa_os_get_tick_ms();
                 if (++ins->ping_pong_lost_cnt >= WS_PINGPONG_RETRY_CNT) {
@@ -749,6 +884,7 @@ lisa_ws_err_e lisa_ws_cleanup(lisa_ws_t *ins)
         ins->connect_sem = NULL;
     }
 
+    lisa_websocket_rx_msg_reset(ins);
     lisa_mem_free(ins);
 
     return LISA_WS_OK;

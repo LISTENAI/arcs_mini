@@ -38,6 +38,13 @@ typedef enum {
  */
 typedef int (*app_player_pa_ctrl_cb_t)(int onoff);
 
+/**
+ * @brief PCM 输出回调函数类型
+ * @param data  PCM 数据指针
+ * @param size  数据大小（字节）
+ */
+typedef void (*app_player_pcm_output_cb_t)(char *data, int size);
+
 // ==================== 音频焦点管理类型（可选功能） ====================
 
 #ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
@@ -106,7 +113,8 @@ typedef struct {
  * @brief app_player 初始化配置结构体
  */
 typedef struct {
-    app_player_pa_ctrl_cb_t pa_ctrl_callback;  /**< PA 控制回调函数（必填） */
+    app_player_pa_ctrl_cb_t pa_ctrl_callback;      /**< PA 控制回调函数（必填） */
+    app_player_pcm_output_cb_t pcm_output_callback; /**< PCM 输出回调（可选，NULL 则使用默认 lisa_audio） */
 
 #ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
     const app_player_focus_channel_config_t *focus_configs; /**< 焦点通道配置数组（可选） */
@@ -154,6 +162,8 @@ typedef void (*app_player_event_cb_t)(app_player_t *player, app_player_event_t e
 typedef struct {
     const char *url;        /**< 播放 URL（必填） */
     uint32_t throw_time_ms; /**< 开始指定时长内的低能量段（毫秒，0=不跳过） */
+    uint32_t request_tag;   /**< Callback correlation tag, copied to player events. */
+    const volatile uint32_t *cancel_token; /**< Request is cancelled when token differs from request_tag. */
 } app_player_play_opt_t;
 
 /**
@@ -205,6 +215,12 @@ int app_player_play(app_player_t *player, const char *url);
  */
 int app_player_play_ex(app_player_t *player, const app_player_play_opt_t *opt);
 
+/** @brief Return the request tag of the callback currently being dispatched. */
+uint32_t app_player_get_callback_request_tag(app_player_t *player);
+
+/** @brief Cancel a pending/current play request before it reaches playback. */
+int app_player_cancel_pending(app_player_t *player);
+
 /**
  * @brief   停止播放（同步）
  * @param   player 播放器实例
@@ -239,6 +255,24 @@ int app_player_resume(app_player_t *player);
  * @note    同步接口，等待重置完成后返回
  */
 int app_player_reset(app_player_t *player);
+
+/**
+ * @brief   设置播放器Prepared所需的解码帧数
+ * @param   player 播放器实例
+ * @param   count 解码帧数，0为非法参数
+ * @return  APP_PLAYER_OK 成功，其他表示错误
+ * @note    需要在app_player_play/prepare前设置，当前正在播放的decode实例不会立即生效
+ */
+int app_player_set_decode_prepared_count(app_player_t *player, uint32_t count);
+
+/**
+ * @brief   设置播放器 readstream 缓存大小
+ * @param   player 播放器实例
+ * @param   size 缓存大小，单位 byte；0 表示关闭缓存
+ * @return  APP_PLAYER_OK 成功，其他表示错误
+ * @note    需要在app_player_play/prepare前设置，当前已创建的readstream实例不会立即生效
+ */
+int app_player_set_readstream_buf_size(app_player_t *player, uint32_t size);
 
 /**
  * @brief   跳转到指定位置

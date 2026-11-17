@@ -5,6 +5,7 @@ if (DEFINED CONFIG_ARCS_HAL_AT_CMD)
     listenai_library_sources(
         atcmd.c
         atcmd_hash.c
+	event.c
     )
 
     if (CONFIG_WIFI OR CONFIG_LWIP)
@@ -28,6 +29,7 @@ if (DEFINED CONFIG_ARCS_HAL_AT_CMD)
             atcmd_bt.c
             atcmd_bt_if.c
         )
+        listenai_compile_definitions(AT_TYPE_BT=1)
     endif()
     
     # Add include directories

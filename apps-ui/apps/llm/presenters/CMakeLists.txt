@@ -2,6 +2,7 @@ target_sources(
     ${LISA_UI_LIB_NAME}
     PRIVATE
     home_presenter.c
+    home_camera_preview_presenter.c
     info_presenter.c
     setting_presenter.c
     setting_common_presenter.c
@@ -11,10 +12,15 @@ target_sources(
     alarm_success_presenter.c
     alarm_ring_presenter.c
     quota_qrcode_presenter.c
+    sd_music_sync_presenter.c
 )
 
 if(CONFIG_OTA)
     target_sources(${LISA_UI_LIB_NAME} PRIVATE ota_presenter.c)
+endif()
+
+if(CONFIG_LOG_UPLOAD)
+    target_sources(${LISA_UI_LIB_NAME} PRIVATE log_upload_presenter.c)
 endif()
 
 target_include_directories(

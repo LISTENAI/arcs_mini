@@ -23,8 +23,8 @@ void HAL_EnableICache(void){
 #if HAL_ICACHE_VALID
     __disable_irq();
 	EnableICache();
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -43,8 +43,8 @@ void HAL_DisableICache(void){
 #if HAL_ICACHE_VALID
     __disable_irq();
 	DisableICache();
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -63,8 +63,8 @@ void HAL_InvalidateICache(void){
 #if HAL_ICACHE_VALID
     __disable_irq();
 	MInvalICache();
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -88,8 +88,8 @@ void HAL_InvalidateICache_by_Addr(uint32_t *addr, uint32_t dsize){
     unsigned long cnt = 0;
     cnt = ((uint32_t)addr % HAL_ICACHE_CFG_LINE_SIZE + dsize + (HAL_ICACHE_CFG_LINE_SIZE - 1)) / HAL_ICACHE_CFG_LINE_SIZE;
     MInvalICacheLines((unsigned long)addr, (unsigned long)cnt);
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -111,8 +111,8 @@ void HAL_LockICache_by_Addr(uint32_t *addr, uint32_t dsize){
     unsigned long cnt = 0;
     cnt = ((uint32_t)addr % HAL_ICACHE_CFG_LINE_SIZE + dsize + (HAL_ICACHE_CFG_LINE_SIZE - 1)) / HAL_ICACHE_CFG_LINE_SIZE;
     MLockICacheLines((unsigned long)addr, (unsigned long)cnt);
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -134,8 +134,8 @@ void HAL_UnLockICache_by_Addr(uint32_t *addr, uint32_t dsize){
     unsigned long cnt = 0;
     cnt = ((uint32_t)addr % HAL_ICACHE_CFG_LINE_SIZE + dsize + (HAL_ICACHE_CFG_LINE_SIZE - 1)) / HAL_ICACHE_CFG_LINE_SIZE;
     MUnlockICacheLines((unsigned long)addr, (unsigned long)cnt);
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -155,8 +155,8 @@ void HAL_EnableDCache(void){
 #if HAL_DCACHE_VALID
     __disable_irq();
 	EnableDCache();
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -176,8 +176,8 @@ void HAL_DisableDCache(void){
 #if HAL_DCACHE_VALID
     __disable_irq();
 	DisableDCache();
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -199,8 +199,8 @@ void HAL_InvalidateDCache(void){
 #if HAL_DCACHE_VALID
     __disable_irq();
     MInvalDCache();
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -221,8 +221,8 @@ void HAL_FlushDCache(void){
 #if HAL_DCACHE_VALID
     __disable_irq();
 	MFlushDCache();
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -243,8 +243,8 @@ void HAL_FlushInvalidateDCache(void){
 #if HAL_DCACHE_VALID
     __disable_irq();
 	MFlushInvalDCache();
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -268,8 +268,8 @@ void HAL_InvalidateDCache_by_Addr(uint32_t *addr, uint32_t dsize){
 	unsigned long cnt = 0;
 	cnt = ((uint32_t)addr % HAL_DCACHE_CFG_LINE_SIZE + dsize + (HAL_DCACHE_CFG_LINE_SIZE - 1)) / HAL_DCACHE_CFG_LINE_SIZE;
 	MInvalDCacheLines((unsigned long)addr, (unsigned long)cnt);
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -291,8 +291,8 @@ void HAL_FlushDCache_by_Addr(uint32_t *addr, uint32_t dsize){
 	unsigned long cnt = 0;
 	cnt = ((uint32_t)addr % HAL_DCACHE_CFG_LINE_SIZE + dsize + (HAL_DCACHE_CFG_LINE_SIZE - 1)) / HAL_DCACHE_CFG_LINE_SIZE;
 	MFlushDCacheLines((unsigned long)addr, (unsigned long)cnt);
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -316,8 +316,8 @@ void HAL_FlushInvalidateDCache_by_Addr(uint32_t *addr, uint32_t dsize){
 	unsigned long cnt = 0;
 	cnt = ((uint32_t)addr % HAL_DCACHE_CFG_LINE_SIZE + dsize + (HAL_DCACHE_CFG_LINE_SIZE - 1)) / HAL_DCACHE_CFG_LINE_SIZE;
 	MFlushInvalDCacheLines((unsigned long)addr, (unsigned long)cnt);
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -339,8 +339,8 @@ void HAL_LockDCache_by_Addr(uint32_t *addr, uint32_t dsize){
     unsigned long cnt = 0;
     cnt = ((uint32_t)addr % HAL_DCACHE_CFG_LINE_SIZE + dsize + (HAL_DCACHE_CFG_LINE_SIZE - 1)) / HAL_DCACHE_CFG_LINE_SIZE;
     MLockDCacheLines((unsigned long)addr, (unsigned long)cnt);
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -362,8 +362,8 @@ void HAL_UnLockDCache_by_Addr(uint32_t *addr, uint32_t dsize){
     unsigned long cnt = 0;
     cnt = ((uint32_t)addr % HAL_DCACHE_CFG_LINE_SIZE + dsize + (HAL_DCACHE_CFG_LINE_SIZE - 1)) / HAL_DCACHE_CFG_LINE_SIZE;
     MUnlockDCacheLines((unsigned long)addr, (unsigned long)cnt);
-    
-    
+
+
     __enable_irq();
 #endif
 }
@@ -388,25 +388,25 @@ void unaligned_cache_line_move(unsigned char* src, unsigned char* dst, unsigned 
 }
 void dcache_clean_range(unsigned long start, unsigned long end){
     uint32_t line_mask = HAL_DCACHE_CFG_LINE_SIZE - 1;
-    
+
     // 对start向上取整到cache line边界
     unsigned long aligned_start = (start + line_mask) & (~line_mask);
-    
+
     // 对end向下取整到cache line边界
     unsigned long aligned_end = end & (~line_mask);
-    
+
     __disable_irq();
     // 只有当有完整的cache line需要处理时才进行操作
     if (aligned_start < aligned_end) {
         HAL_FlushDCache_by_Addr((uint32_t *)aligned_start, (aligned_end - aligned_start));
     }
-    
+
     // 对不对齐的部分进行单独处理
     if (start < aligned_start) {
         // 处理start到aligned_start之间的数据
         // 这里需要更细粒度的处理方式
     }
-    
+
     if (end > aligned_end) {
         // 处理aligned_end到end之间的数据
         // 这里需要更细粒度的处理方式
@@ -416,26 +416,26 @@ void dcache_clean_range(unsigned long start, unsigned long end){
 
 void dcache_invalidate_range(unsigned long start, unsigned long end){
     uint32_t line_mask = HAL_DCACHE_CFG_LINE_SIZE - 1;
-    
+
     // 对start向上取整到cache line边界
     unsigned long aligned_start = (start + line_mask) & (~line_mask);
-    
+
     // 对end向下取整到cache line边界
     unsigned long aligned_end = end & (~line_mask);
 
     __disable_irq();
-    
+
     // 只有当有完整的cache line需要处理时才进行操作
     if (aligned_start < aligned_end) {
         HAL_InvalidateDCache_by_Addr((uint32_t *)aligned_start, (aligned_end - aligned_start));
     }
-    
+
     // 对不对齐的部分进行单独处理
     if (start < aligned_start) {
         // 处理start到aligned_start之间的数据
         // 这里需要更细粒度的处理方式
     }
-    
+
     if (end > aligned_end) {
         // 处理aligned_end到end之间的数据
         // 这里需要更细粒度的处理方式
@@ -445,26 +445,26 @@ void dcache_invalidate_range(unsigned long start, unsigned long end){
 
 void dcache_flush_range(unsigned long start, unsigned long end){
 	uint32_t line_mask = HAL_DCACHE_CFG_LINE_SIZE - 1;
-	
+
 	// 对start向上取整到cache line边界
 	unsigned long aligned_start = (start + line_mask) & (~line_mask);
-	
+
 	// 对end向下取整到cache line边界
 	unsigned long aligned_end = end & (~line_mask);
-	
+
     __disable_irq();
 	// 只有当有完整的cache line需要处理时才进行操作
 	if (aligned_start < aligned_end) {
 		HAL_FlushDCache_by_Addr((uint32_t *)aligned_start, (aligned_end - aligned_start));
 		HAL_InvalidateDCache_by_Addr((uint32_t *)aligned_start, (aligned_end - aligned_start));
 	}
-	
+
 	// 对不对齐的部分进行单独处理
 	if (start < aligned_start) {
 		// 处理start到aligned_start之间的数据
 		// 这里需要更细粒度的处理方式
 	}
-	
+
 	if (end > aligned_end) {
 		// 处理aligned_end到end之间的数据
 		// 这里需要更细粒度的处理方式

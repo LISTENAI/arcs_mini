@@ -111,7 +111,7 @@ static int netcfg_ble_dump_data(uint8_t *data, uint16_t len)
         NETCFG_BLE_PRINT("%02x ", data[i]);
         if (!((i + 1) % 6))
             NETCFG_BLE_PRINT("\n");
-            }
+    }
 
     if ((i % 6))
         NETCFG_BLE_PRINT("\n");
@@ -320,6 +320,15 @@ static void netcfg_bles_cb_att_val_set(uint8_t conidx, uint8_t user_lid, uint16_
                 }
             }
             break;
+        case NETCFG_BLE_OP_SKIP_WIFI:
+            NETCFG_BLE_LOGD("Get OP NETCFG_BLE_OP_SKIP_WIFI\n");
+            if ((netcfg_bles_env.p_cb != NULL) && (netcfg_bles_env.p_cb->cb_value_set != NULL)) {
+                notify_stat = netcfg_bles_env.state =
+                    netcfg_bles_env.p_cb->cb_value_set(conidx, att_idx, opcode, NULL);
+            } else {
+                notify_stat = netcfg_bles_env.state = NETCFG_BLE_ERR;
+            }
+            break;
         case NETCFG_BLE_OP_REBOOT:
             if ((netcfg_bles_env.p_cb != NULL) && (netcfg_bles_env.p_cb->cb_value_set != NULL)) {
                 netcfg_bles_env.p_cb->cb_value_set(conidx, att_idx, opcode, NULL);
@@ -454,4 +463,3 @@ uint16_t ble_netcfg_bles_send_notify(uint8_t conidx, uint16_t item, uint16_t sta
     }
     return netcfg_bles_send_notify(conidx, item, status);
 }
-
